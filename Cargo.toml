@@ -1,0 +1,20 @@
+[package]
+name = "zipimage-resizer"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[profile.release]
+# lto = true
+strip = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+image = "0"
+rayon = "1"
+tempfile = "3"
+walkdir = "2"
+webp = "0"
+zip = "0"
