@@ -15,7 +15,8 @@ clap = { version = "4", features = ["derive"] }
 image = "0"
 indicatif = { version = "0", features = ["rayon"] }
 rayon = "1"
+ripunzip = "2"
 tempfile = "3"
 walkdir = "2"
 webp = "0"
-zip = "4"
+zip = "2"

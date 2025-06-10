@@ -1,7 +1,8 @@
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use indicatif::{ProgressBar, ProgressStyle};
+use ripunzip::{NullProgressReporter, UnzipEngine, UnzipOptions};
 
 use crate::fs_util;
 
@@ -25,14 +26,20 @@ pub fn get_file_count<P: AsRef<Path>>(zip_file: P) -> zip::result::ZipResult<usi
 ///
 /// * `zip_file` - 解凍するzipファイル
 /// * `output_dir` - 解凍先のディレクトリ
-pub fn unzip<P1: AsRef<Path>, P2: AsRef<Path>>(
+pub fn unzip<P1: AsRef<Path>, P2: Into<PathBuf>>(
     zip_file: P1,
     output_dir: P2,
-) -> zip::result::ZipResult<()> {
+) -> anyhow::Result<()> {
     let file = File::open(zip_file)?;
-    let mut archive = zip::ZipArchive::new(file)?;
-
-    archive.extract(output_dir)
+    let engine = UnzipEngine::for_file(file)?;
+    let options = UnzipOptions {
+        output_directory: Some(output_dir.into()),
+        password: None,
+        single_threaded: false,
+        filename_filter: None,
+        progress_reporter: Box::new(NullProgressReporter),
+    };
+    engine.unzip(options)
 }
 
 fn get_options(path: &Path) -> zip::write::SimpleFileOptions {
