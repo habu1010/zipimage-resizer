@@ -1,10 +1,18 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use indicatif::{ProgressBar, ProgressStyle};
-use ripunzip::{NullProgressReporter, UnzipEngine, UnzipOptions};
+use indicatif::ProgressBar;
+use ripunzip::{UnzipEngine, UnzipOptions, UnzipProgressReporter};
 
 use crate::fs_util;
+
+struct UnzipProgressBar(ProgressBar);
+
+impl UnzipProgressReporter for UnzipProgressBar {
+    fn extraction_finished(&self, _display_name: &str) {
+        self.0.inc(1);
+    }
+}
 
 /// zipファイルに含まれるファイル数を取得する
 /// # Arguments
@@ -26,19 +34,25 @@ pub fn get_file_count<P: AsRef<Path>>(zip_file: P) -> zip::result::ZipResult<usi
 ///
 /// * `zip_file` - 解凍するzipファイル
 /// * `output_dir` - 解凍先のディレクトリ
-pub fn unzip<P1: AsRef<Path>, P2: Into<PathBuf>>(
+/// * `pb` - 進捗表示に使うプログレスバー
+pub fn unzip_with_progress<P1: AsRef<Path>, P2: Into<PathBuf>>(
     zip_file: P1,
     output_dir: P2,
+    pb: ProgressBar,
 ) -> anyhow::Result<()> {
-    let file = File::open(zip_file)?;
+    pb.set_position(0);
+    pb.set_length(get_file_count(&zip_file)? as u64);
+
+    let file = File::open(&zip_file)?;
     let engine = UnzipEngine::for_file(file)?;
     let options = UnzipOptions {
         output_directory: Some(output_dir.into()),
         password: None,
-        single_threaded: false,
+        single_threaded: true,
         filename_filter: None,
-        progress_reporter: Box::new(NullProgressReporter),
+        progress_reporter: Box::new(UnzipProgressBar(pb.clone())),
     };
+
     engine.unzip(options)
 }
 
@@ -107,23 +121,21 @@ where
 /// # Arguments
 /// * `src_dir` - 圧縮するディレクトリ
 /// * `dst_file` - 圧縮先のzipファイル
-pub fn zip<P1: AsRef<Path>>(src_dir: P1, dst_file: &File) -> std::io::Result<()> {
+/// * `pb` - 進捗表示に使うプログレスバー
+pub fn zip_with_progress<P1: AsRef<Path>>(
+    src_dir: P1,
+    dst_file: &File,
+    pb: ProgressBar,
+) -> std::io::Result<()> {
     let mut zw = zip::ZipWriter::new(dst_file);
 
     let file_count = fs_util::scan_regular_files(&src_dir).count();
-    let pb = ProgressBar::new(file_count as u64)
-        .with_message("Zipping files...")
-        .with_style(
-            ProgressStyle::with_template("{msg:20} [{bar:40.cyan/blue}] {pos}/{len} ETA:{eta}")
-                .unwrap()
-                .progress_chars("#>-"),
-        );
+    pb.set_position(0);
+    pb.set_length(file_count as u64);
 
     zip_process_dir(&mut zw, &src_dir, src_dir.as_ref(), &pb)?;
 
     zw.finish()?;
-
-    pb.finish_with_message("Zipping completed");
 
     Ok(())
 }
