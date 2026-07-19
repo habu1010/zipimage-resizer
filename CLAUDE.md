@@ -1,0 +1,64 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## プロジェクト概要
+
+zip でまとめられた画像（電子書籍・漫画アーカイブを想定）を、画像を WebP に再エンコード・縮小することで軽量化し、新しい zip として出力する CLI ツール。
+
+```
+zipimage-resizer [-d 出力先ディレクトリ] [--min-height 1800] [-k|--keep-mtime] <zipfile>...
+```
+
+- `-d/--output_dir` 未指定時は、元ファイル名に `_resized` サフィックスを付けたパスへ出力する（`determine_output_path`）。
+- `-k/--keep-mtime` で出力 zip の最終更新日時を元ファイルに合わせる。
+
+## 開発コマンド
+
+```bash
+cargo build              # デバッグビルド
+cargo build --release    # リリースビルド（strip 有効）
+cargo test               # テスト実行
+cargo test test_append_suffix_to_filename   # 単一テスト実行
+cargo clippy             # lint
+cargo fmt                # フォーマット
+```
+
+## アーキテクチャ
+
+### 4 段のパイプライン（[src/app.rs](src/app.rs)）
+
+`run()` が 4 つのワーカースレッドを立ち上げ、`std::sync::mpsc` チャネルで繋いだパイプラインを構成する。各段は自身の `ProgressBar` を持ち、`MultiProgress` で同時表示される。
+
+1. `spawn_size_check_thread` — zip のファイルサイズ ÷ 内包ファイル数で 1 ファイル平均サイズを求め、**500KB 超のものだけ**を下流に流す（既に十分小さい zip は処理しない）。
+2. `spawn_zip_extraction_thread` — `tempfile::TempDir` に展開。ここだけ `sync_channel(3)` でバックプレッシャーをかけ、一時ディレクトリが際限なく溜まるのを防いでいる。
+3. `spawn_image_resizing_thread` — 展開ファイルを rayon で並列にリサイズ。**1 枚も変換されなかった zip は下流に送らない**（＝出力ファイルを作らない）。
+4. `spawn_zip_creation_thread` — 一旦 `tempfile::tempfile()` に zip を書き、完了後に本来の出力先へコピーする（途中終了時に壊れた zip を残さないため）。
+
+`ProcessingContext` が段間で受け渡される単位で、`TempDir` を所有しているためコンテキストが drop されると展開先も自動削除される。
+
+### エラー処理方針
+
+- 個々のファイルの失敗（壊れた zip など）は `Reporter::report_error` でログに出して**次のファイルへ進む**。1 ファイルのために全体を止めない。`tx.send()` の失敗だけは下流が消えている合図なのでスレッドを終了させる。
+- エラーメッセージは `MultiProgress::suspend` 経由で出す。そうしないとプログレスバーの描画と衝突して表示が崩れる。
+- 失敗件数は `Reporter` が `AtomicUsize` で数え、1 件でもあれば `run()` の最後にエラーを返す（終了コードが非ゼロになる）。
+- `run()` は 4 つのスレッドを**全て join してから**エラーを判定する。途中で `?` すると残りのスレッドが強制終了され、書きかけの zip が残るため。エラーは下流から順に探す（上流のエラーはチャネル切断による波及で、根本原因ではない）。
+- 出力先ディレクトリは処理開始前に検証する（最終段まで進んでから失敗すると、それまでの展開・変換が無駄になる）。存在しない場合は作らずにエラーとする。
+- ユーザーに表示するメッセージは英語で書く（コード内コメントは日本語）。
+
+### 画像変換方針（[src/image_util.rs](src/image_util.rs), `resize_image_file_webp`）
+
+- 変換対象外の判定: 既に WebP かつ 1MB 未満のファイルはスキップ（戻り値 `false`）。デコードに失敗したファイル（画像でないもの）も無視して `false` を返し、処理は継続する。
+- `ReduceSize::reduce_size` は高さが閾値以上のときだけ Lanczos3 で縮小する（拡大はしない）。
+- `ToWebPMemory::to_webp` は品質 95 → 85 → … → 15 と下げながらエンコードし、**1MB 以下に収まった最初の結果**を採用する。全滅時は品質 10 で確定。
+- 元ファイルは削除し、拡張子を `.webp` に変えて書き出す（zip 内のファイル名が変わる点に注意）。
+
+### zip 入出力（[src/zip_util.rs](src/zip_util.rs)）
+
+- 展開は `ripunzip` の `UnzipEngine`。進捗表示付きの `unzip_with_progress` は `single_threaded: true`（進捗カウントの整合性のため）。
+- 圧縮は `zip` クレート。画像系拡張子（jpg/jpeg/png/webp）は `CompressionMethod::Stored`（無圧縮）にし、それ以外はデフォルト圧縮。既圧縮の画像を再圧縮しないための最適化。
+- `zip_process_dir` はファイル → サブディレクトリの順で再帰し、パスは基準ディレクトリからの相対パスで格納する。
+
+### 未使用コード
+
+`resize_image_file_jpg`（app.rs）は現状のパイプラインからは呼ばれていない（`#[allow(dead_code)]` 付き）。削除ではなく残されているので、参照する前に本当に必要か確認すること。
