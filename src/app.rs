@@ -384,7 +384,16 @@ impl Reporter {
         }
     }
 
-    fn add_progress_bar(&self, pb: ProgressBar) -> ProgressBar {
+    /// パイプラインの段ごとの進捗表示を追加する（`label` は表示の先頭に付く段の名前）
+    fn add_stage_bar(&self, label: &str, len: u64) -> ProgressBar {
+        let style = ProgressStyle::with_template(
+            "{prefix} [{bar:20.cyan/blue}] {pos}/{len} ETA:{eta} {msg}",
+        )
+        .unwrap()
+        .progress_chars("#>-");
+        let pb = ProgressBar::new(len)
+            .with_style(style)
+            .with_prefix(label.to_string());
         self.mp.add(pb)
     }
 
@@ -479,15 +488,7 @@ fn spawn_size_check_thread(
     jobs: Vec<ZipJob>,
     reporter: &Reporter,
 ) -> (JoinHandle<Result<()>>, Receiver<ZipJob>) {
-    let pb = reporter.add_progress_bar(
-        ProgressBar::new(jobs.len() as u64).with_style(
-            ProgressStyle::with_template(
-                "Size checking [{bar:20.cyan/blue}] {pos}/{len} ETA:{eta} {msg}",
-            )
-            .unwrap()
-            .progress_chars("#>-"),
-        ),
-    );
+    let pb = reporter.add_stage_bar("Size checking", jobs.len() as u64);
 
     let reporter = reporter.clone();
     let (tx, rx) = mpsc::channel();
@@ -529,15 +530,7 @@ fn spawn_zip_extraction_thread(
     size_check_rx: Receiver<ZipJob>,
     reporter: &Reporter,
 ) -> (JoinHandle<Result<()>>, Receiver<ProcessingContext>) {
-    let pb = reporter.add_progress_bar(
-        ProgressBar::new(0).with_style(
-            ProgressStyle::with_template(
-                "Extracting [{bar:20.cyan/blue}] {pos}/{len} ETA:{eta} {msg}",
-            )
-            .unwrap()
-            .progress_chars("#>-"),
-        ),
-    );
+    let pb = reporter.add_stage_bar("Extracting", 0);
 
     let reporter = reporter.clone();
     let (tx, rx) = mpsc::sync_channel(MAX_PENDING_WORK_DIRS);
@@ -566,15 +559,7 @@ fn spawn_image_resizing_thread(
     zip_extraction_rx: Receiver<ProcessingContext>,
     reporter: &Reporter,
 ) -> (JoinHandle<Result<()>>, Receiver<ProcessingContext>) {
-    let pb = reporter.add_progress_bar(
-        ProgressBar::new(0).with_style(
-            ProgressStyle::with_template(
-                "Resizing images [{bar:20.cyan/blue}] {pos}/{len} ETA:{eta} {msg}",
-            )
-            .unwrap()
-            .progress_chars("#>-"),
-        ),
-    );
+    let pb = reporter.add_stage_bar("Resizing images", 0);
 
     let reporter = reporter.clone();
     let (tx, rx) = mpsc::sync_channel(MAX_PENDING_WORK_DIRS);
@@ -654,15 +639,7 @@ fn spawn_zip_creation_thread(
     image_resizing_rx: Receiver<ProcessingContext>,
     reporter: &Reporter,
 ) -> JoinHandle<Result<()>> {
-    let pb = reporter.add_progress_bar(
-        ProgressBar::new(0).with_style(
-            ProgressStyle::with_template(
-                "Creating zip [{bar:20.cyan/blue}] {pos}/{len} ETA:{eta} {msg}",
-            )
-            .unwrap()
-            .progress_chars("#>-"),
-        ),
-    );
+    let pb = reporter.add_stage_bar("Creating zip", 0);
 
     let reporter = reporter.clone();
     std::thread::spawn(move || {
