@@ -62,6 +62,7 @@ cargo fmt                # フォーマット
 - 展開は `ripunzip` の `UnzipEngine`。進捗表示付きの `unzip_with_progress` は `single_threaded: true`（進捗カウントの整合性のため）。
 - 圧縮は `zip` クレート。画像系拡張子（jpg/jpeg/png/webp）は `CompressionMethod::Stored`（無圧縮）にし、それ以外はデフォルト圧縮。既圧縮の画像を再圧縮しないための最適化。
 - `zip_process_dir` はファイル → サブディレクトリの順で再帰し、パスは基準ディレクトリからの相対パスで格納する。
+- ディレクトリ走査（`zip_process_dir` と `fs_util::scan_regular_files`）のエラーは無視せず返す。無視すると、読めなかったファイルが黙って出力 zip から抜け落ちるため。
 
 ### 未使用コード
 

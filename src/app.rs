@@ -478,7 +478,13 @@ fn spawn_image_resizing_thread(
     let handle = std::thread::spawn(move || {
         for ctx in zip_extraction_rx {
             pb.set_message(ctx.job.src_file.to_string_lossy().into_owned());
-            let files: Vec<_> = fs_util::scan_regular_files(ctx.work_dir.path()).collect();
+            let files: Vec<_> = match fs_util::scan_regular_files(ctx.work_dir.path()).collect() {
+                Ok(files) => files,
+                Err(e) => {
+                    reporter.report_error(format!("Error scanning {:?}: {e}", ctx.job.src_file));
+                    continue;
+                }
+            };
             match resize_image_files(&files, min_height, pb.clone()) {
                 // 1 枚も変換されなかった zip は出力しない
                 Ok(resized) if resized > 0 => tx.send(ctx)?,
@@ -698,7 +704,9 @@ mod tests {
             }
         }
 
-        let files: Vec<PathBuf> = crate::fs_util::scan_regular_files(dir.path()).collect();
+        let files: Vec<PathBuf> = crate::fs_util::scan_regular_files(dir.path())
+            .collect::<std::io::Result<_>>()
+            .unwrap();
         let resized =
             super::resize_image_files(&files, 1800, indicatif::ProgressBar::hidden()).unwrap();
         (resized, list_names(dir.path()))

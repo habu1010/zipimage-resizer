@@ -84,12 +84,12 @@ where
     W: std::io::Write + std::io::Seek,
     P: AsRef<Path>,
 {
+    // 走査エラーを無視すると、そのファイルが黙って zip から抜け落ちるのでエラーにする
     let entries = walkdir::WalkDir::new(&dir)
         .max_depth(1)
         .sort_by_file_name()
         .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
 
     for file in entries.iter().filter(|e| e.file_type().is_file()) {
         let path = file.path();
@@ -129,13 +129,49 @@ pub fn zip_with_progress<P1: AsRef<Path>>(
 ) -> std::io::Result<()> {
     let mut zw = zip::ZipWriter::new(dst_file);
 
-    let file_count = fs_util::scan_regular_files(&src_dir).count();
+    let file_count =
+        fs_util::scan_regular_files(&src_dir).try_fold(0u64, |n, file| file.map(|_| n + 1))?;
     pb.set_position(0);
-    pb.set_length(file_count as u64);
+    pb.set_length(file_count);
 
     zip_process_dir(&mut zw, &src_dir, src_dir.as_ref(), &pb)?;
 
     zw.finish()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use indicatif::ProgressBar;
+
+    // 読めないディレクトリがあれば、中のファイルを抜かした zip を作らずにエラーにする。
+    // zip_with_progress は件数を数える時点でエラーを返すため、zip_process_dir 単体でも確認する
+
+    #[test]
+    #[cfg(unix)]
+    fn test_zip_with_progress_reports_unreadable_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(_restore) = crate::fs_util::tests::unreadable_subdir(dir.path()) else {
+            return;
+        };
+
+        let dst = tempfile::tempfile().unwrap();
+        let result = super::zip_with_progress(dir.path(), &dst, ProgressBar::hidden());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_zip_process_dir_reports_unreadable_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(_restore) = crate::fs_util::tests::unreadable_subdir(dir.path()) else {
+            return;
+        };
+
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let result =
+            super::zip_process_dir(&mut zw, dir.path(), dir.path(), &ProgressBar::hidden());
+        assert!(result.is_err());
+    }
 }
