@@ -95,8 +95,12 @@ fn resize_image_file_webp(src: &Path, min_height: u32) -> Result<Option<PathBuf>
         return Ok(None);
     }
 
-    let Ok(image) = image_util::decode_with_orientation(reader) else {
-        return Ok(None);
+    let image = match image_util::decode_with_orientation(reader) {
+        Ok(image) => image,
+        // 画像でない（形式を判定できない）ファイルや未対応の形式は、変換対象外として黙って残す
+        Err(image::ImageError::Unsupported(_)) => return Ok(None),
+        // 画像と判定できたのにデコードできないのは壊れた画像なので、エラーとして報告する
+        Err(e) => return Err(anyhow::Error::new(e).context("failed to decode")),
     };
 
     let webp = image.reduce_size(min_height).to_webp(MAX_WEBP_SIZE)?;
@@ -108,7 +112,12 @@ fn resize_image_file_webp(src: &Path, min_height: u32) -> Result<Option<PathBuf>
     tmp.write_all(webp.as_ref())?;
     let tmp = tmp.into_temp_path().keep()?;
 
-    std::fs::remove_file(src)?;
+    // 元画像を消せなかった場合は、変換結果を消して元画像だけを残す
+    // （失敗しても zip の処理を続けるため、変換結果の残骸を zip に紛れ込ませない）
+    if let Err(e) = std::fs::remove_file(src) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
 
     Ok(Some(tmp))
 }
@@ -213,23 +222,80 @@ fn existing_names(dir: &Path, exclude: &HashSet<&Path>) -> Result<HashSet<String
     Ok(names)
 }
 
-fn resize_image_files(files: &[PathBuf], min_height: u32, pb: ProgressBar) -> Result<usize> {
+/// `resize_image_files` の結果
+struct ResizeOutcome {
+    /// 変換できた画像の枚数
+    converted: usize,
+    /// 変換に失敗した画像とその理由（パス順）。これらの画像は元のまま残っている
+    failed: Vec<(PathBuf, anyhow::Error)>,
+}
+
+/// `files` を WebP に変換する
+///
+/// 個々の画像の変換に失敗しても、その画像は元のまま残して `failed` に記録し、
+/// 残りの画像の変換を続ける（1 枚のために zip 全体を諦めない）。
+fn resize_image_files(
+    files: &[PathBuf],
+    min_height: u32,
+    pb: ProgressBar,
+) -> Result<ResizeOutcome> {
     pb.set_position(0);
     pb.set_length(files.len() as u64);
 
-    let converted: Vec<_> = files
+    let results: Vec<_> = files
         .par_iter()
         .progress_with(pb)
-        .map(|src| Ok(resize_image_file_webp(src, min_height)?.map(|tmp| (src.clone(), tmp))))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
+        .map(|src| (src, resize_image_file_webp(src, min_height)))
         .collect();
 
-    let count = converted.len();
+    let mut converted = Vec::new();
+    let mut failed = Vec::new();
+    for (src, result) in results {
+        match result {
+            Ok(Some(tmp)) => converted.push((src.clone(), tmp)),
+            Ok(None) => {}
+            Err(e) => failed.push((src.clone(), e)),
+        }
+    }
+    failed.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let outcome = ResizeOutcome {
+        converted: converted.len(),
+        failed,
+    };
     rename_to_final_names(converted)?;
 
-    Ok(count)
+    Ok(outcome)
+}
+
+/// 変換に失敗した画像を、zip ごとに 1 件のエラーとしてまとめた文面にする
+///
+/// ディスクフルなどで大量に失敗しても表示が溢れないよう、個別のファイルは先頭の数件だけ示す。
+/// パスは一時ディレクトリではなく zip 内のパスで示す。
+fn format_conversion_failures(ctx: &ProcessingContext, outcome: &ResizeOutcome) -> String {
+    use std::fmt::Write as _;
+
+    const MAX_LISTED: usize = 5;
+
+    let failed = &outcome.failed;
+    let total = outcome.converted + failed.len();
+    let mut msg = format!(
+        "Failed to convert {} of {total} image(s) in {:?}",
+        failed.len(),
+        ctx.job.src_file
+    );
+    if outcome.converted > 0 {
+        msg.push_str(" (written with the originals kept)");
+    }
+    msg.push(':');
+    for (file, e) in failed.iter().take(MAX_LISTED) {
+        let file = file.strip_prefix(ctx.work_dir.path()).unwrap_or(file);
+        let _ = write!(msg, "\n  {}: {e:#}", file.display());
+    }
+    if failed.len() > MAX_LISTED {
+        let _ = write!(msg, "\n  ... and {} more", failed.len() - MAX_LISTED);
+    }
+    msg
 }
 
 fn append_suffix_to_filename<P: AsRef<Path>>(path: P, suffix: &str) -> PathBuf {
@@ -490,9 +556,15 @@ fn spawn_image_resizing_thread(
                 }
             };
             match resize_image_files(&files, min_height, pb.clone()) {
-                // 1 枚も変換されなかった zip は出力しない
-                Ok(resized) if resized > 0 => tx.send(ctx)?,
-                Ok(_) => {}
+                Ok(outcome) => {
+                    if !outcome.failed.is_empty() {
+                        reporter.report_error(format_conversion_failures(&ctx, &outcome));
+                    }
+                    // 1 枚も変換されなかった zip は出力しない
+                    if outcome.converted > 0 {
+                        tx.send(ctx)?;
+                    }
+                }
                 Err(e) => {
                     reporter.report_error(format!("Error resizing {:?}: {e}", ctx.job.src_file));
                 }
@@ -619,7 +691,7 @@ pub fn run() -> Result<()> {
     // 個々のファイルの失敗は処理を止めないが、終了コードには反映する
     let error_count = reporter.error_count();
     if error_count > 0 {
-        anyhow::bail!("{error_count} file(s) failed");
+        anyhow::bail!("{error_count} file(s) had errors");
     }
 
     Ok(())
@@ -695,12 +767,9 @@ mod tests {
             }
         }
 
-        let files: Vec<PathBuf> = crate::fs_util::scan_regular_files(dir.path())
-            .collect::<std::io::Result<_>>()
-            .unwrap();
-        let resized =
-            super::resize_image_files(&files, 1800, indicatif::ProgressBar::hidden()).unwrap();
-        (resized, list_names(dir.path()))
+        let outcome = resize_dir(dir.path());
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        (outcome.converted, list_names(dir.path()))
     }
 
     #[test]
@@ -729,6 +798,74 @@ mod tests {
         let (resized, names) = resize_files_in_tempdir(&["anim.gif", "still.gif"]);
         assert_eq!(resized, 1);
         assert_eq!(names, ["anim.gif", "still.webp"]);
+    }
+
+    /// `dir` 内の全ファイルを変換する
+    fn resize_dir(dir: &Path) -> super::ResizeOutcome {
+        let files: Vec<PathBuf> = crate::fs_util::scan_regular_files(dir)
+            .collect::<std::io::Result<_>>()
+            .unwrap();
+        super::resize_image_files(&files, 1800, indicatif::ProgressBar::hidden()).unwrap()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_resize_image_files_continues_on_error() {
+        // 読めない画像があっても、その画像は元のまま残して他の画像の変換を続ける
+        let dir = tempfile::tempdir().unwrap();
+        crate::test_util::write_image(&dir.path().join("001.png"));
+        crate::test_util::write_image(&dir.path().join("002.png"));
+        let Some(_restore) = crate::test_util::make_unreadable(&dir.path().join("002.png")) else {
+            return;
+        };
+
+        let outcome = resize_dir(dir.path());
+        assert_eq!(outcome.converted, 1);
+        let failed: Vec<_> = outcome.failed.iter().map(|(file, _)| file).collect();
+        assert_eq!(failed, [&dir.path().join("002.png")]);
+        assert_eq!(list_names(dir.path()), ["001.webp", "002.png"]);
+    }
+
+    #[test]
+    fn test_resize_image_files_reports_corrupt_image() {
+        // 画像と判定できるのにデコードできない（壊れた）画像は報告し、画像でないファイルは黙って残す
+        let dir = tempfile::tempdir().unwrap();
+        crate::test_util::write_image(&dir.path().join("001.png"));
+        let png = std::fs::read(dir.path().join("001.png")).unwrap();
+        std::fs::write(dir.path().join("002.png"), &png[..png.len() / 2]).unwrap();
+        std::fs::write(dir.path().join("readme.txt"), b"not an image").unwrap();
+
+        let outcome = resize_dir(dir.path());
+        assert_eq!(outcome.converted, 1);
+        let failed: Vec<_> = outcome.failed.iter().map(|(file, _)| file).collect();
+        assert_eq!(failed, [&dir.path().join("002.png")]);
+        assert_eq!(
+            list_names(dir.path()),
+            ["001.webp", "002.png", "readme.txt"]
+        );
+    }
+
+    #[test]
+    fn test_format_conversion_failures() {
+        // zip 内のパスで、先頭の 5 件だけを示す
+        let ctx = processing_context(PathBuf::from("book.zip"), PathBuf::from("out.zip"));
+        let failed = (1..=7)
+            .map(|i| {
+                let file = ctx.work_dir.path().join(format!("{i:03}.png"));
+                (file, anyhow::anyhow!("broken"))
+            })
+            .collect();
+        let outcome = super::ResizeOutcome {
+            converted: 3,
+            failed,
+        };
+
+        assert_eq!(
+            super::format_conversion_failures(&ctx, &outcome),
+            "Failed to convert 7 of 10 image(s) in \"book.zip\" (written with the originals kept):\n  \
+             001.png: broken\n  002.png: broken\n  003.png: broken\n  004.png: broken\n  \
+             005.png: broken\n  ... and 2 more"
+        );
     }
 
     #[test]

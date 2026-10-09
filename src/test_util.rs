@@ -2,28 +2,34 @@
 
 use std::path::Path;
 
-/// `dir` に読み取り権限のないサブディレクトリを作る
+/// `path`（ファイルまたはディレクトリ）を読み取り権限のない状態にする
 ///
 /// root で実行しているなどで権限を無視して読めてしまう場合は `None` を返す
-/// （呼び出し側はテストをスキップする）。戻り値を drop すると権限を戻す。
+/// （呼び出し側はテストをスキップする）。戻り値を drop すると元の権限に戻す。
 #[cfg(unix)]
-pub fn unreadable_subdir(dir: &Path) -> Option<impl Drop> {
+pub fn make_unreadable(path: &Path) -> Option<impl Drop> {
     use std::os::unix::fs::PermissionsExt;
 
-    struct Restore(std::path::PathBuf);
+    struct Restore(std::path::PathBuf, std::fs::Permissions);
     impl Drop for Restore {
         fn drop(&mut self) {
             // TempDir が削除できるよう権限を戻す
-            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::set_permissions(&self.0, self.1.clone());
         }
     }
 
+    // 途中で panic しても権限が戻るよう、権限を変える前にガードを作る
+    let restore = Restore(path.to_path_buf(), path.metadata().unwrap().permissions());
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::File::open(path).is_err().then_some(restore)
+}
+
+/// `dir` に読み取り権限のないサブディレクトリを作る（詳細は `make_unreadable`）
+#[cfg(unix)]
+pub fn unreadable_subdir(dir: &Path) -> Option<impl Drop> {
     let sub = dir.join("sub");
     std::fs::create_dir(&sub).unwrap();
-    // 途中で panic しても権限が戻るよう、権限を変える前にガードを作る
-    let restore = Restore(sub.clone());
-    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
-    std::fs::read_dir(&sub).is_err().then_some(restore)
+    make_unreadable(&sub)
 }
 
 /// 小さい静止画を書き出す（形式は拡張子で決まる。WebP は変換対象外になるサイズ）
