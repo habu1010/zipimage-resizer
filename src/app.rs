@@ -11,7 +11,7 @@ use std::{
     thread::JoinHandle,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
@@ -141,15 +141,20 @@ fn resize_image_file_webp(src: &Path, max_height: u32) -> Result<Option<PathBuf>
     // 既存のファイルと衝突しない一意な名前で作成する（失敗時は自動で削除される）
     let mut tmp = tempfile::Builder::new()
         .suffix(".webp.tmp")
-        .tempfile_in(parent_dir(src))?;
-    tmp.write_all(webp.as_ref())?;
-    let tmp = tmp.into_temp_path().keep()?;
+        .tempfile_in(parent_dir(src))
+        .context("failed to create a temporary file")?;
+    tmp.write_all(webp.as_ref())
+        .context("failed to write the converted image")?;
+    let tmp = tmp
+        .into_temp_path()
+        .keep()
+        .context("failed to keep the converted image")?;
 
     // 元画像を消せなかった場合は、変換結果を消して元画像だけを残す
     // （失敗しても zip の処理を続けるため、変換結果の残骸を zip に紛れ込ませない）
     if let Err(e) = std::fs::remove_file(src) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
+        return Err(anyhow::Error::new(e).context("failed to remove the original image"));
     }
 
     Ok(Some(tmp))
@@ -160,6 +165,17 @@ fn parent_dir(path: &Path) -> &Path {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
+    }
+}
+
+/// エラー表示用に、`path` を `base_dir`（展開先の一時ディレクトリ）からの相対パスにする
+///
+/// 一時ディレクトリの絶対パスは報告する時点で消えていて、zip 内のどのファイルかも分からないため。
+fn display_in(path: &Path, base_dir: &Path) -> String {
+    match path.strip_prefix(base_dir) {
+        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+        Ok(rel) => rel.display().to_string(),
+        Err(_) => path.display().to_string(),
     }
 }
 
@@ -205,7 +221,9 @@ fn fallback_webp_names(src: &Path) -> impl Iterator<Item = OsString> {
 /// 実際に変換されたファイルだけを対象に、ディレクトリ内に実在する名前
 /// （ディレクトリも含む）と照合して決める。パス順に割り当てるので、
 /// 結果は並列処理の実行順に左右されない。
-fn rename_to_final_names(mut converted: Vec<(PathBuf, PathBuf)>) -> Result<()> {
+///
+/// エラーには、一時ディレクトリの絶対パスではなく `base_dir` からの相対パス（zip 内のパス）を示す。
+fn rename_to_final_names(mut converted: Vec<(PathBuf, PathBuf)>, base_dir: &Path) -> Result<()> {
     converted.sort();
 
     // 変換後の名前同士の衝突を数える
@@ -224,7 +242,9 @@ fn rename_to_final_names(mut converted: Vec<(PathBuf, PathBuf)>) -> Result<()> {
         let names = match taken.entry(dir) {
             Entry::Occupied(e) => e.into_mut(),
             // 未 rename の一時ファイルは使用済みとして扱わない
-            Entry::Vacant(e) => e.insert(existing_names(dir, &pending)?),
+            Entry::Vacant(e) => e.insert(existing_names(dir, &pending).with_context(|| {
+                format!("failed to read directory {}", display_in(dir, base_dir))
+            })?),
         };
 
         let natural = natural_webp_name(src);
@@ -237,14 +257,20 @@ fn rename_to_final_names(mut converted: Vec<(PathBuf, PathBuf)>) -> Result<()> {
                 .unwrap()
         };
         names.insert(name_key(&name));
-        std::fs::rename(tmp, dir.join(name))?;
+        let dst = dir.join(name);
+        std::fs::rename(tmp, &dst).with_context(|| {
+            format!(
+                "failed to rename the converted image to {}",
+                display_in(&dst, base_dir)
+            )
+        })?;
     }
 
     Ok(())
 }
 
 /// `dir` 直下にある名前（ディレクトリも含む）の衝突判定用キーを集める（`exclude` は除く）
-fn existing_names(dir: &Path, exclude: &HashSet<&Path>) -> Result<HashSet<String>> {
+fn existing_names(dir: &Path, exclude: &HashSet<&Path>) -> std::io::Result<HashSet<String>> {
     let mut names = HashSet::new();
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
@@ -267,8 +293,11 @@ struct ResizeOutcome {
 ///
 /// 個々の画像の変換に失敗しても、その画像は元のまま残して `failed` に記録し、
 /// 残りの画像の変換を続ける（1 枚のために zip 全体を諦めない）。
+///
+/// `base_dir` は `files` を展開したディレクトリで、エラーに zip 内のパスを示すのに使う。
 fn resize_image_files(
     files: &[PathBuf],
+    base_dir: &Path,
     max_height: u32,
     pb: ProgressBar,
 ) -> Result<ResizeOutcome> {
@@ -296,7 +325,7 @@ fn resize_image_files(
         converted: converted.len(),
         failed,
     };
-    rename_to_final_names(converted)?;
+    rename_to_final_names(converted, base_dir)?;
 
     Ok(outcome)
 }
@@ -313,17 +342,16 @@ fn format_conversion_failures(ctx: &ProcessingContext, outcome: &ResizeOutcome) 
     let failed = &outcome.failed;
     let total = outcome.converted + failed.len();
     let mut msg = format!(
-        "Failed to convert {} of {total} image(s) in {:?}",
+        "Failed to convert {} of {total} image(s) in {}",
         failed.len(),
-        ctx.job.src_file
+        ctx.job.src_file.display()
     );
     if outcome.converted > 0 {
         msg.push_str(" (written with the originals kept)");
     }
     msg.push(':');
     for (file, e) in failed.iter().take(MAX_LISTED) {
-        let file = file.strip_prefix(ctx.work_dir.path()).unwrap_or(file);
-        let _ = write!(msg, "\n  {}: {e:#}", file.display());
+        let _ = write!(msg, "\n  {}: {e:#}", display_in(file, ctx.work_dir.path()));
     }
     if failed.len() > MAX_LISTED {
         let _ = write!(msg, "\n  ... and {} more", failed.len() - MAX_LISTED);
@@ -405,6 +433,11 @@ impl Reporter {
         self.mp.suspend(|| eprintln!("{msg}"));
     }
 
+    /// `path` についての処理（`action`）の失敗を、原因まで含めて報告する
+    fn report_failure(&self, action: &str, path: &Path, e: impl std::fmt::Display) {
+        self.report_error(format!("Error {action} {}: {e:#}", path.display()));
+    }
+
     fn error_count(&self) -> usize {
         self.error_count.load(Ordering::Relaxed)
     }
@@ -431,7 +464,7 @@ fn plan_jobs(
         let canonical = match src.canonicalize() {
             Ok(canonical) => canonical,
             Err(e) => {
-                reporter.report_error(format!("Error reading {}: {e}", src.display()));
+                reporter.report_failure("reading", &src, e);
                 continue;
             }
         };
@@ -451,7 +484,7 @@ fn plan_jobs(
         let normalized = match normalize_path(&dst) {
             Ok(normalized) => normalized,
             Err(e) => {
-                reporter.report_error(format!("Error resolving {}: {e}", dst.display()));
+                reporter.report_failure("resolving", &dst, e);
                 continue;
             }
         };
@@ -504,7 +537,7 @@ fn spawn_size_check_thread(
                     tx.send(job)?;
                 }
                 Err(e) => {
-                    reporter.report_error(format!("Error calculating size for {zipfile:?}: {e}"));
+                    reporter.report_failure("calculating size for", zipfile, e);
                 }
                 _ => {}
             }
@@ -521,7 +554,7 @@ fn spawn_size_check_thread(
 
 /// zip を一時ディレクトリへ展開する
 fn extract_zip(src_file: &Path, pb: &ProgressBar) -> Result<tempfile::TempDir> {
-    let work_dir = tempfile::tempdir()?;
+    let work_dir = tempfile::tempdir().context("failed to create a temporary directory")?;
     zip_util::unzip_with_progress(src_file, work_dir.path(), pb.clone())?;
     Ok(work_dir)
 }
@@ -541,7 +574,7 @@ fn spawn_zip_extraction_thread(
             let work_dir = match extract_zip(&job.src_file, &pb) {
                 Ok(work_dir) => work_dir,
                 Err(e) => {
-                    reporter.report_error(format!("Error extracting {:?}: {e}", job.src_file));
+                    reporter.report_failure("extracting", &job.src_file, e);
                     continue;
                 }
             };
@@ -569,11 +602,11 @@ fn spawn_image_resizing_thread(
             let files: Vec<_> = match fs_util::scan_regular_files(ctx.work_dir.path()).collect() {
                 Ok(files) => files,
                 Err(e) => {
-                    reporter.report_error(format!("Error scanning {:?}: {e}", ctx.job.src_file));
+                    reporter.report_failure("scanning", &ctx.job.src_file, e);
                     continue;
                 }
             };
-            match resize_image_files(&files, max_height, pb.clone()) {
+            match resize_image_files(&files, ctx.work_dir.path(), max_height, pb.clone()) {
                 Ok(outcome) => {
                     if !outcome.failed.is_empty() {
                         reporter.report_error(format_conversion_failures(&ctx, &outcome));
@@ -584,7 +617,7 @@ fn spawn_image_resizing_thread(
                     }
                 }
                 Err(e) => {
-                    reporter.report_error(format!("Error resizing {:?}: {e}", ctx.job.src_file));
+                    reporter.report_failure("resizing", &ctx.job.src_file, e);
                 }
             }
         }
@@ -617,19 +650,40 @@ fn create_resized_zip(ctx: &ProcessingContext, keep_mtime: bool, pb: &ProgressBa
         use std::os::unix::fs::PermissionsExt;
         builder.permissions(std::fs::Permissions::from_mode(0o666));
     }
-    let dst_tempfile = builder.tempfile_in(parent_dir(dst_file))?;
+    let dst_dir = parent_dir(dst_file);
+    let dst_tempfile = builder
+        .tempfile_in(dst_dir)
+        .with_context(|| format!("failed to create a temporary file in {}", dst_dir.display()))?;
 
-    zip_util::zip_with_progress(ctx.work_dir.path(), dst_tempfile.as_file(), pb.clone())?;
+    zip_util::zip_with_progress(ctx.work_dir.path(), dst_tempfile.as_file(), pb.clone())
+        .context("failed to write the zip")?;
 
     if keep_mtime {
-        let src_mtime = ctx.job.src_file.metadata()?.modified()?;
-        dst_tempfile.as_file().set_modified(src_mtime)?;
+        let src_file = &ctx.job.src_file;
+        let src_mtime = src_file
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .with_context(|| {
+                format!(
+                    "failed to read the modification time of {}",
+                    src_file.display()
+                )
+            })?;
+        dst_tempfile
+            .as_file()
+            .set_modified(src_mtime)
+            .context("failed to set the modification time")?;
     }
 
     // データをディスクに書き出してから置き換える。そうしないと、電源断などの際に
     // rename だけが反映され、既存の正しい出力が空や壊れたファイルに置き換わることがある
-    dst_tempfile.as_file().sync_all()?;
-    dst_tempfile.persist(dst_file)?;
+    dst_tempfile
+        .as_file()
+        .sync_all()
+        .context("failed to flush the zip to disk")?;
+    dst_tempfile
+        .persist(dst_file)
+        .context("failed to move the completed zip into place")?;
 
     Ok(())
 }
@@ -646,7 +700,7 @@ fn spawn_zip_creation_thread(
         for ctx in image_resizing_rx {
             pb.set_message(ctx.job.dst_file.to_string_lossy().into_owned());
             if let Err(e) = create_resized_zip(&ctx, keep_mtime, &pb) {
-                reporter.report_error(format!("Error creating {:?}: {e}", ctx.job.dst_file));
+                reporter.report_failure("creating", &ctx.job.dst_file, e);
             }
         }
         pb.finish_with_message("Creating zip completed");
@@ -731,6 +785,22 @@ mod tests {
         let parse = |height: &str| super::Args::try_parse_from(["prog", "--max-height", height]);
         assert!(parse("0").is_err());
         assert_eq!(parse("1").unwrap().max_height, 1);
+    }
+
+    #[test]
+    fn test_display_in() {
+        let base = Path::new("/tmp/.tmpA1b2");
+        // 展開先からの相対パス（zip 内のパス）で表示する
+        assert_eq!(
+            super::display_in(&base.join("chapter1/001.webp"), base),
+            "chapter1/001.webp"
+        );
+        assert_eq!(super::display_in(base, base), ".");
+        // 展開先の外のパスはそのまま
+        assert_eq!(
+            super::display_in(Path::new("/out/a.zip"), base),
+            "/out/a.zip"
+        );
     }
 
     #[test]
@@ -824,7 +894,7 @@ mod tests {
         let files: Vec<PathBuf> = crate::fs_util::scan_regular_files(dir)
             .collect::<std::io::Result<_>>()
             .unwrap();
-        super::resize_image_files(&files, 1800, indicatif::ProgressBar::hidden()).unwrap()
+        super::resize_image_files(&files, dir, 1800, indicatif::ProgressBar::hidden()).unwrap()
     }
 
     #[test]
@@ -881,7 +951,7 @@ mod tests {
 
         assert_eq!(
             super::format_conversion_failures(&ctx, &outcome),
-            "Failed to convert 7 of 10 image(s) in \"book.zip\" (written with the originals kept):\n  \
+            "Failed to convert 7 of 10 image(s) in book.zip (written with the originals kept):\n  \
              001.png: broken\n  002.png: broken\n  003.png: broken\n  004.png: broken\n  \
              005.png: broken\n  ... and 2 more"
         );
@@ -913,10 +983,13 @@ mod tests {
         std::fs::write(&tmp_jpg, b"jpg").unwrap();
         std::fs::write(&tmp_png, b"png").unwrap();
 
-        super::rename_to_final_names(vec![
-            (dir.path().join("001.png"), tmp_png),
-            (dir.path().join("001.jpg"), tmp_jpg),
-        ])
+        super::rename_to_final_names(
+            vec![
+                (dir.path().join("001.png"), tmp_png),
+                (dir.path().join("001.jpg"), tmp_jpg),
+            ],
+            dir.path(),
+        )
         .unwrap();
 
         assert_eq!(
@@ -1120,7 +1193,16 @@ mod tests {
         std::fs::create_dir(&dst).unwrap();
 
         let ctx = processing_context(src, dst.clone());
-        assert!(super::create_resized_zip(&ctx, false, &indicatif::ProgressBar::hidden()).is_err());
+        let err =
+            super::create_resized_zip(&ctx, false, &indicatif::ProgressBar::hidden()).unwrap_err();
+        // どの段階で、どのファイルについて失敗したかがエラーに含まれる
+        let msg = format!("{err:#}");
+        assert!(
+            msg.starts_with("failed to move the completed zip into place: "),
+            "{msg}"
+        );
+
+        drop(err);
 
         assert!(dst.is_dir());
         assert_eq!(list_names(dir.path()), ["a.zip", "a_resized.zip"]);

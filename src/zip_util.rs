@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use indicatif::ProgressBar;
 use ripunzip::{UnzipEngine, UnzipOptions, UnzipProgressReporter};
 
@@ -80,7 +81,7 @@ fn zip_process_dir<W, P>(
     dir: P,
     base_dir: &Path,
     pb: &ProgressBar,
-) -> std::io::Result<()>
+) -> anyhow::Result<()>
 where
     W: std::io::Write + std::io::Seek,
     P: AsRef<Path>,
@@ -100,7 +101,8 @@ where
 
         let options = get_options(path);
 
-        let mut file = std::fs::File::open(path)?;
+        let mut file =
+            std::fs::File::open(path).with_context(|| format!("failed to read {filepath}"))?;
         zw.start_file(filepath, options)?;
         std::io::copy(&mut file, zw)?;
     }
@@ -127,7 +129,7 @@ pub fn zip_with_progress<P1: AsRef<Path>>(
     src_dir: P1,
     dst_file: &File,
     pb: ProgressBar,
-) -> std::io::Result<()> {
+) -> anyhow::Result<()> {
     // ZipWriter は小さな書き込み（ヘッダやコピー時の 8KB 単位の書き込み）を大量に行うため、
     // バッファしてシステムコールの回数を減らす
     const WRITE_BUF_SIZE: usize = 1024 * 1024; // 1MB（変換後の WebP 1 枚がほぼ 1 回の書き込みに収まる）
