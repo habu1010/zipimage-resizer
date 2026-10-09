@@ -37,10 +37,18 @@ struct Args {
     zipfiles: Vec<PathBuf>,
 }
 
-struct ProcessingContext {
-    work_dir: tempfile::TempDir,
+/// 処理する zip とその出力先の組
+///
+/// 出力先は `plan_jobs` で検証済みのものを一度だけ決め、後段はそれをそのまま使う。
+#[derive(Debug, PartialEq)]
+struct ZipJob {
     src_file: PathBuf,
     dst_file: PathBuf,
+}
+
+struct ProcessingContext {
+    work_dir: tempfile::TempDir,
+    job: ZipJob,
 }
 
 #[allow(dead_code)]
@@ -101,8 +109,12 @@ fn resize_image_file_webp(src: &Path, min_height: u32) -> Result<Option<PathBuf>
     Ok(Some(tmp))
 }
 
+/// 親ディレクトリを返す（`a.zip` のような相対パスのファイル名だけの場合は `.`）
 fn parent_dir(path: &Path) -> &Path {
-    path.parent().unwrap_or(Path::new("."))
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
 }
 
 /// 衝突判定用のキー（大文字小文字を区別しないファイルシステムも考慮する）
@@ -232,6 +244,16 @@ fn determine_output_path(path: &Path, output_dir: &Option<PathBuf>) -> PathBuf {
     }
 }
 
+/// 同じファイルかどうかを比較できるよう、パスを正規化する
+///
+/// 存在しないパス（これから作る出力先など）は、親ディレクトリだけを正規化する。
+fn normalize_path(path: &Path) -> std::io::Result<PathBuf> {
+    path.canonicalize().or_else(|_| {
+        let parent = parent_dir(path).canonicalize()?;
+        Ok(parent.join(path.file_name().unwrap_or_default()))
+    })
+}
+
 fn calc_average_size_per_file<P: AsRef<Path>>(path: P) -> Result<u64> {
     let file_size = path.as_ref().metadata()?.len();
     let file_count = zip_util::get_file_count(path)? as u64;
@@ -276,12 +298,86 @@ impl Reporter {
     }
 }
 
-fn spawn_size_check_thread(
+/// 各入力の出力先を決め、原本や他の出力を上書きするものを除いた処理対象を返す
+///
+/// 例えば `-d` に入力元と同じディレクトリを指定すると出力先が入力ファイル自身になり、
+/// 原本が壊れる。展開・変換を始める前に、正規化したパスで以下を検証する。
+///
+/// - 出力先が入力ファイル（自身でも他の入力でも）と重なる入力は処理しない
+/// - 出力先が重なる場合は、先に指定された入力だけを処理する
+/// - 同じファイルが重複して指定された場合は、1 つにまとめる
+///
+/// 処理しない入力は `Reporter` で報告し、残りの処理は続ける。
+fn plan_jobs(
     zipfiles: Vec<PathBuf>,
+    output_dir: &Option<PathBuf>,
     reporter: &Reporter,
-) -> (JoinHandle<Result<()>>, Receiver<PathBuf>) {
+) -> Vec<ZipJob> {
+    let mut inputs = Vec::new();
+    let mut input_paths = HashSet::new();
+    for src in zipfiles {
+        let canonical = match src.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(e) => {
+                reporter.report_error(format!("Error reading {}: {e}", src.display()));
+                continue;
+            }
+        };
+        if !canonical.is_file() {
+            reporter.report_error(format!("Skipping {}: not a file", src.display()));
+            continue;
+        }
+        if input_paths.insert(canonical) {
+            inputs.push(src);
+        }
+    }
+
+    let mut outputs: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let mut jobs = Vec::new();
+    for src in inputs {
+        let dst = determine_output_path(&src, output_dir);
+        let normalized = match normalize_path(&dst) {
+            Ok(normalized) => normalized,
+            Err(e) => {
+                reporter.report_error(format!("Error resolving {}: {e}", dst.display()));
+                continue;
+            }
+        };
+
+        if input_paths.contains(&normalized) {
+            reporter.report_error(format!(
+                "Skipping {}: output {} would overwrite an input file",
+                src.display(),
+                dst.display()
+            ));
+            continue;
+        }
+        match outputs.entry(normalized) {
+            Entry::Occupied(other) => reporter.report_error(format!(
+                "Skipping {}: output {} is also the output of {}",
+                src.display(),
+                dst.display(),
+                other.get().display()
+            )),
+            Entry::Vacant(entry) => {
+                entry.insert(src.clone());
+                jobs.push(ZipJob {
+                    src_file: src,
+                    dst_file: dst,
+                });
+            }
+        }
+    }
+
+    jobs
+}
+
+fn spawn_size_check_thread(
+    jobs: Vec<ZipJob>,
+    reporter: &Reporter,
+) -> (JoinHandle<Result<()>>, Receiver<ZipJob>) {
     let pb = reporter.add_progress_bar(
-        ProgressBar::new(zipfiles.len() as u64).with_style(
+        ProgressBar::new(jobs.len() as u64).with_style(
             ProgressStyle::with_template(
                 "Size checking [{bar:20.cyan/blue}] {pos}/{len} ETA:{eta} {msg}",
             )
@@ -293,14 +389,15 @@ fn spawn_size_check_thread(
     let reporter = reporter.clone();
     let (tx, rx) = mpsc::channel();
     let handle = std::thread::spawn(move || {
-        let total = zipfiles.len();
+        let total = jobs.len();
         let mut to_convert = 0;
-        for zipfile in zipfiles {
+        for job in jobs {
+            let zipfile = &job.src_file;
             pb.set_message(zipfile.to_string_lossy().into_owned());
-            match calc_average_size_per_file(&zipfile) {
+            match calc_average_size_per_file(zipfile) {
                 Ok(size_per_file) if size_per_file > 500 * 1024 => {
                     to_convert += 1;
-                    tx.send(zipfile)?;
+                    tx.send(job)?;
                 }
                 Err(e) => {
                     reporter.report_error(format!("Error calculating size for {zipfile:?}: {e}"));
@@ -318,26 +415,15 @@ fn spawn_size_check_thread(
     (handle, rx)
 }
 
-/// zip を一時ディレクトリへ展開し、後続の段へ渡すコンテキストを作る
-fn extract_zip(
-    src_file: &Path,
-    output_dir: &Option<PathBuf>,
-    pb: &ProgressBar,
-) -> Result<ProcessingContext> {
-    let dst_file = determine_output_path(src_file, output_dir);
+/// zip を一時ディレクトリへ展開する
+fn extract_zip(src_file: &Path, pb: &ProgressBar) -> Result<tempfile::TempDir> {
     let work_dir = tempfile::tempdir()?;
     zip_util::unzip_with_progress(src_file, work_dir.path(), pb.clone())?;
-
-    Ok(ProcessingContext {
-        work_dir,
-        src_file: src_file.to_path_buf(),
-        dst_file,
-    })
+    Ok(work_dir)
 }
 
 fn spawn_zip_extraction_thread(
-    output_dir: Option<PathBuf>,
-    size_check_rx: Receiver<PathBuf>,
+    size_check_rx: Receiver<ZipJob>,
     reporter: &Reporter,
 ) -> (JoinHandle<Result<()>>, Receiver<ProcessingContext>) {
     let pb = reporter.add_progress_bar(
@@ -353,17 +439,17 @@ fn spawn_zip_extraction_thread(
     let reporter = reporter.clone();
     let (tx, rx) = mpsc::sync_channel(3);
     let handle = std::thread::spawn(move || {
-        for src_file in size_check_rx {
-            pb.set_message(src_file.to_string_lossy().into_owned());
+        for job in size_check_rx {
+            pb.set_message(job.src_file.to_string_lossy().into_owned());
             // 1 ファイルの失敗で全体を止めず、次のファイルへ進む
-            let ctx = match extract_zip(&src_file, &output_dir, &pb) {
-                Ok(ctx) => ctx,
+            let work_dir = match extract_zip(&job.src_file, &pb) {
+                Ok(work_dir) => work_dir,
                 Err(e) => {
-                    reporter.report_error(format!("Error extracting {src_file:?}: {e}"));
+                    reporter.report_error(format!("Error extracting {:?}: {e}", job.src_file));
                     continue;
                 }
             };
-            tx.send(ctx)?;
+            tx.send(ProcessingContext { work_dir, job })?;
         }
         pb.finish_with_message("Extracting completed");
         Ok(())
@@ -391,14 +477,14 @@ fn spawn_image_resizing_thread(
     let (tx, rx) = mpsc::channel();
     let handle = std::thread::spawn(move || {
         for ctx in zip_extraction_rx {
-            pb.set_message(ctx.src_file.to_string_lossy().into_owned());
+            pb.set_message(ctx.job.src_file.to_string_lossy().into_owned());
             let files: Vec<_> = fs_util::scan_regular_files(ctx.work_dir.path()).collect();
             match resize_image_files(&files, min_height, pb.clone()) {
                 // 1 枚も変換されなかった zip は出力しない
                 Ok(resized) if resized > 0 => tx.send(ctx)?,
                 Ok(_) => {}
                 Err(e) => {
-                    reporter.report_error(format!("Error resizing {:?}: {e}", ctx.src_file));
+                    reporter.report_error(format!("Error resizing {:?}: {e}", ctx.job.src_file));
                 }
             }
         }
@@ -418,11 +504,11 @@ fn create_resized_zip(ctx: &ProcessingContext, keep_mtime: bool, pb: &ProgressBa
 
     // dst_tempfile -> dst_file
     dst_tempfile.rewind()?;
-    let mut dst_zipfile = std::fs::File::create(&ctx.dst_file)?;
+    let mut dst_zipfile = std::fs::File::create(&ctx.job.dst_file)?;
     std::io::copy(&mut dst_tempfile, &mut dst_zipfile)?;
 
     if keep_mtime {
-        let src_mtime = ctx.src_file.metadata()?.modified()?;
+        let src_mtime = ctx.job.src_file.metadata()?.modified()?;
         dst_zipfile.set_modified(src_mtime)?;
     }
 
@@ -447,11 +533,11 @@ fn spawn_zip_creation_thread(
     let reporter = reporter.clone();
     std::thread::spawn(move || {
         for ctx in image_resizing_rx {
-            pb.set_message(ctx.dst_file.to_string_lossy().into_owned());
+            pb.set_message(ctx.job.dst_file.to_string_lossy().into_owned());
             if let Err(e) = create_resized_zip(&ctx, keep_mtime, &pb) {
                 // コピー途中で失敗した場合、壊れた zip を残さない
-                let _ = std::fs::remove_file(&ctx.dst_file);
-                reporter.report_error(format!("Error creating {:?}: {e}", ctx.dst_file));
+                let _ = std::fs::remove_file(&ctx.job.dst_file);
+                reporter.report_error(format!("Error creating {:?}: {e}", ctx.job.dst_file));
             }
         }
         pb.finish_with_message("Creating zip completed");
@@ -479,10 +565,11 @@ pub fn run() -> Result<()> {
     }
 
     let reporter = Reporter::new();
+    let jobs = plan_jobs(zipfiles, &output_dir, &reporter);
 
-    let (size_check_handle, size_check_rx) = spawn_size_check_thread(zipfiles, &reporter);
+    let (size_check_handle, size_check_rx) = spawn_size_check_thread(jobs, &reporter);
     let (zip_extraction_handle, zip_extraction_rx) =
-        spawn_zip_extraction_thread(output_dir, size_check_rx, &reporter);
+        spawn_zip_extraction_thread(size_check_rx, &reporter);
     let (image_resizing_handle, image_resizing_rx) =
         spawn_image_resizing_thread(min_height, zip_extraction_rx, &reporter);
     let zip_creation_handle = spawn_zip_creation_thread(keep_mtime, image_resizing_rx, &reporter);
@@ -664,5 +751,121 @@ mod tests {
             std::fs::read(dir.path().join("001.png.webp")).unwrap(),
             b"existing"
         );
+    }
+
+    #[test]
+    fn test_parent_dir() {
+        assert_eq!(super::parent_dir(Path::new("/d/a.zip")), Path::new("/d"));
+        // ファイル名だけの相対パスはカレントディレクトリ
+        assert_eq!(super::parent_dir(Path::new("a.zip")), Path::new("."));
+    }
+
+    /// `files` を空ファイルとして作成し、そのパスを返す
+    fn touch_files(dir: &Path, files: &[&str]) -> Vec<PathBuf> {
+        files
+            .iter()
+            .map(|file| {
+                let path = dir.join(file);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, b"").unwrap();
+                path
+            })
+            .collect()
+    }
+
+    /// `plan_jobs` を実行し、処理対象の入力とエラー件数を返す
+    fn plan(zipfiles: Vec<PathBuf>, output_dir: Option<PathBuf>) -> (Vec<PathBuf>, usize) {
+        let reporter = super::Reporter::new();
+        let jobs = super::plan_jobs(zipfiles, &output_dir, &reporter);
+        let srcs = jobs.into_iter().map(|job| job.src_file).collect();
+        (srcs, reporter.error_count())
+    }
+
+    #[test]
+    fn test_plan_jobs_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        let zipfiles = touch_files(dir.path(), &["a.zip", "b.zip"]);
+
+        let reporter = super::Reporter::new();
+        let jobs = super::plan_jobs(zipfiles.clone(), &Some(out.clone()), &reporter);
+        assert_eq!(reporter.error_count(), 0);
+        assert_eq!(
+            jobs,
+            [
+                super::ZipJob {
+                    src_file: zipfiles[0].clone(),
+                    dst_file: out.join("a.zip"),
+                },
+                super::ZipJob {
+                    src_file: zipfiles[1].clone(),
+                    dst_file: out.join("b.zip"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_plan_jobs_output_dir_is_input_dir() {
+        // -d に入力元と同じディレクトリを指定すると、原本を上書きしてしまう
+        let dir = tempfile::tempdir().unwrap();
+        let zipfiles = touch_files(dir.path(), &["a.zip"]);
+
+        let (srcs, errors) = plan(zipfiles, Some(dir.path().join(".")));
+        assert!(srcs.is_empty());
+        assert_eq!(errors, 1);
+    }
+
+    #[test]
+    fn test_plan_jobs_output_is_another_input() {
+        // 再実行時に前回の出力が glob に含まれた場合など。a.zip の出力先 a_resized.zip が
+        // 別の入力と重なるので a.zip だけを除き、残りは処理を続ける
+        let dir = tempfile::tempdir().unwrap();
+        let zipfiles = touch_files(dir.path(), &["a.zip", "a_resized.zip", "b.zip"]);
+
+        let (srcs, errors) = plan(zipfiles.clone(), None);
+        assert_eq!(srcs, &zipfiles[1..]);
+        assert_eq!(errors, 1);
+    }
+
+    #[test]
+    fn test_plan_jobs_same_output() {
+        // -d 指定時、別ディレクトリの同名 zip は同じ出力先になるので、先に指定した方だけを処理する
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        let zipfiles = touch_files(dir.path(), &["x/a.zip", "y/a.zip"]);
+
+        let (srcs, errors) = plan(zipfiles.clone(), Some(out));
+        assert_eq!(srcs, &zipfiles[..1]);
+        assert_eq!(errors, 1);
+    }
+
+    #[test]
+    fn test_plan_jobs_duplicate_input() {
+        // 同じファイルを別の書き方で重複して指定しても、エラーにせず 1 つにまとめる
+        let dir = tempfile::tempdir().unwrap();
+        let zipfiles = touch_files(dir.path(), &["a.zip"]);
+        let duplicate = dir.path().join(".").join("a.zip");
+
+        let (srcs, errors) = plan(vec![zipfiles[0].clone(), duplicate], None);
+        assert_eq!(srcs, zipfiles);
+        assert_eq!(errors, 0);
+    }
+
+    #[test]
+    fn test_plan_jobs_invalid_input() {
+        // 存在しない入力やディレクトリは報告して除く（panic しない）
+        let dir = tempfile::tempdir().unwrap();
+        let zipfiles = vec![
+            dir.path().join("missing.zip"),
+            dir.path().join("."),
+            PathBuf::from("/"),
+        ];
+
+        let (srcs, errors) = plan(zipfiles, None);
+        assert!(srcs.is_empty());
+        assert_eq!(errors, 3);
     }
 }
