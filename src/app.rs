@@ -20,6 +20,14 @@ use crate::fs_util;
 use crate::image_util::{self, ReduceSize, ToWebPMemory};
 use crate::zip_util;
 
+/// 展開済み zip（一時ディレクトリ）を受け渡すチャネル 1 本あたりに溜めておける数
+///
+/// 上限がないと、下流の段が遅いときに展開済みの一時ディレクトリが際限なく溜まり、
+/// ディスクを圧迫する。上限はチャネルごとなので、同時に存在する一時ディレクトリは
+/// 2 本のチャネル（展開 → リサイズ、リサイズ → zip 作成）に溜まる分と、各段で処理中の
+/// 分を合わせて、最大で `2 * MAX_PENDING_WORK_DIRS + 3` 個になる。
+const MAX_PENDING_WORK_DIRS: usize = 3;
+
 #[derive(Parser, Debug)]
 struct Args {
     /// 出力先ディレクトリ
@@ -507,7 +515,7 @@ fn spawn_zip_extraction_thread(
     );
 
     let reporter = reporter.clone();
-    let (tx, rx) = mpsc::sync_channel(3);
+    let (tx, rx) = mpsc::sync_channel(MAX_PENDING_WORK_DIRS);
     let handle = std::thread::spawn(move || {
         for job in size_check_rx {
             pb.set_message(job.src_file.to_string_lossy().into_owned());
@@ -544,7 +552,7 @@ fn spawn_image_resizing_thread(
     );
 
     let reporter = reporter.clone();
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(MAX_PENDING_WORK_DIRS);
     let handle = std::thread::spawn(move || {
         for ctx in zip_extraction_rx {
             pb.set_message(ctx.job.src_file.to_string_lossy().into_owned());
