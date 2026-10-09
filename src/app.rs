@@ -145,9 +145,12 @@ fn resize_image_file_webp(src: &Path, max_height: u32) -> Result<Option<PathBuf>
         .context("failed to create a temporary file")?;
     tmp.write_all(webp.as_ref())
         .context("failed to write the converted image")?;
+    // エラー（PathPersistError）は一時ファイルを保持しているので、io::Error だけを取り出して
+    // 一時ファイルをその場で削除する（失敗の一覧に残ると zip に紛れ込みうる）
     let tmp = tmp
         .into_temp_path()
         .keep()
+        .map_err(|e| e.error)
         .context("failed to keep the converted image")?;
 
     // 元画像を消せなかった場合は、変換結果を消して元画像だけを残す
@@ -681,8 +684,11 @@ fn create_resized_zip(ctx: &ProcessingContext, keep_mtime: bool, pb: &ProgressBa
         .as_file()
         .sync_all()
         .context("failed to flush the zip to disk")?;
+    // PersistError は一時ファイルを保持しているので、io::Error だけを取り出して
+    // その場で一時ファイルを drop（削除）する
     dst_tempfile
         .persist(dst_file)
+        .map_err(|e| e.error)
         .context("failed to move the completed zip into place")?;
 
     Ok(())
@@ -1202,8 +1208,8 @@ mod tests {
             "{msg}"
         );
 
-        drop(err);
-
+        // err はスコープの終わりまで生きているが、それでも一時ファイルは残っていない
+        // （エラーが一時ファイルを抱えたまま持ち回されない）
         assert!(dst.is_dir());
         assert_eq!(list_names(dir.path()), ["a.zip", "a_resized.zip"]);
     }
