@@ -1,7 +1,7 @@
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
     ffi::{OsStr, OsString},
-    io::{Seek, Write},
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -497,20 +497,39 @@ fn spawn_image_resizing_thread(
 
 /// リサイズ済みのディレクトリから出力先の zip を作成する
 ///
-/// 一旦 tempfile に zip を書き出し、完成してから出力先へコピーする。
+/// 出力先と同じディレクトリの一時ファイルに zip を書き出し、完成してから rename で置き換える。
+/// 途中で失敗・中断しても、出力先に書きかけの zip が現れたり、既存のファイルが壊れたりしない。
+/// 失敗時の一時ファイルは drop 時に自動で削除される。ただし Ctrl-C などで強制終了した場合は
+/// drop されずに残るため、何の残骸か分かるよう出力先の名前を含めておく
+/// （`a_resized.zip` → `.a_resized.zip.XXXXXX.tmp`）。
 fn create_resized_zip(ctx: &ProcessingContext, keep_mtime: bool, pb: &ProgressBar) -> Result<()> {
-    let mut dst_tempfile = tempfile::tempfile()?;
-    zip_util::zip_with_progress(ctx.work_dir.path(), &dst_tempfile, pb.clone())?;
+    let dst_file = &ctx.job.dst_file;
+    let mut prefix = OsString::from(".");
+    prefix.push(dst_file.file_name().unwrap_or_default());
+    prefix.push(".");
 
-    // dst_tempfile -> dst_file
-    dst_tempfile.rewind()?;
-    let mut dst_zipfile = std::fs::File::create(&ctx.job.dst_file)?;
-    std::io::copy(&mut dst_tempfile, &mut dst_zipfile)?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix).suffix(".tmp");
+    // 一時ファイルは既定で所有者のみ読み書き可（0600）になるため、
+    // 通常のファイル作成と同じく umask に従ったパーミッションにする
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let dst_tempfile = builder.tempfile_in(parent_dir(dst_file))?;
+
+    zip_util::zip_with_progress(ctx.work_dir.path(), dst_tempfile.as_file(), pb.clone())?;
 
     if keep_mtime {
         let src_mtime = ctx.job.src_file.metadata()?.modified()?;
-        dst_zipfile.set_modified(src_mtime)?;
+        dst_tempfile.as_file().set_modified(src_mtime)?;
     }
+
+    // データをディスクに書き出してから置き換える。そうしないと、電源断などの際に
+    // rename だけが反映され、既存の正しい出力が空や壊れたファイルに置き換わることがある
+    dst_tempfile.as_file().sync_all()?;
+    dst_tempfile.persist(dst_file)?;
 
     Ok(())
 }
@@ -535,8 +554,6 @@ fn spawn_zip_creation_thread(
         for ctx in image_resizing_rx {
             pb.set_message(ctx.job.dst_file.to_string_lossy().into_owned());
             if let Err(e) = create_resized_zip(&ctx, keep_mtime, &pb) {
-                // コピー途中で失敗した場合、壊れた zip を残さない
-                let _ = std::fs::remove_file(&ctx.job.dst_file);
                 reporter.report_error(format!("Error creating {:?}: {e}", ctx.job.dst_file));
             }
         }
@@ -867,5 +884,82 @@ mod tests {
         let (srcs, errors) = plan(zipfiles, None);
         assert!(srcs.is_empty());
         assert_eq!(errors, 3);
+    }
+
+    /// `dst_file` へ出力する、ファイルを 1 つ含む展開済みディレクトリのコンテキストを作る
+    fn processing_context(src_file: PathBuf, dst_file: PathBuf) -> super::ProcessingContext {
+        let work_dir = tempfile::tempdir().unwrap();
+        std::fs::write(work_dir.path().join("001.webp"), b"image").unwrap();
+        super::ProcessingContext {
+            work_dir,
+            job: super::ZipJob { src_file, dst_file },
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_create_resized_zip() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = touch_files(dir.path(), &["a.zip"]).remove(0);
+        let old_mtime =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(old_mtime)
+            .unwrap();
+        let dst = dir.path().join("a_resized.zip");
+
+        let ctx = processing_context(src, dst.clone());
+        super::create_resized_zip(&ctx, true, &indicatif::ProgressBar::hidden()).unwrap();
+
+        // 出力された zip の中身と mtime
+        let archive = zip::ZipArchive::new(std::fs::File::open(&dst).unwrap()).unwrap();
+        assert_eq!(archive.file_names().collect::<Vec<_>>(), ["001.webp"]);
+        assert_eq!(dst.metadata().unwrap().modified().unwrap(), old_mtime);
+
+        // パーミッションは通常のファイル作成と同じ（一時ファイルの 0600 のままにならない）
+        let reference = touch_files(dir.path(), &["reference"]).remove(0);
+        let mode = |path: &Path| path.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dst), mode(&reference));
+
+        // 一時ファイルが残っていない
+        assert_eq!(
+            list_names(dir.path()),
+            ["a.zip", "a_resized.zip", "reference"]
+        );
+    }
+
+    #[test]
+    fn test_create_resized_zip_failure_keeps_existing_output() {
+        // 途中で失敗しても（ここでは keep_mtime 用の元ファイルが無い）、
+        // 既存の出力先を壊さず、一時ファイルも残さない
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("a_resized.zip");
+        std::fs::write(&dst, b"old").unwrap();
+
+        let ctx = processing_context(dir.path().join("missing.zip"), dst.clone());
+        assert!(super::create_resized_zip(&ctx, true, &indicatif::ProgressBar::hidden()).is_err());
+
+        assert_eq!(std::fs::read(&dst).unwrap(), b"old");
+        assert_eq!(list_names(dir.path()), ["a_resized.zip"]);
+    }
+
+    #[test]
+    fn test_create_resized_zip_persist_failure() {
+        // 置き換え（rename）に失敗しても（ここでは出力先がディレクトリ）、一時ファイルを残さない
+        let dir = tempfile::tempdir().unwrap();
+        let src = touch_files(dir.path(), &["a.zip"]).remove(0);
+        let dst = dir.path().join("a_resized.zip");
+        std::fs::create_dir(&dst).unwrap();
+
+        let ctx = processing_context(src, dst.clone());
+        assert!(super::create_resized_zip(&ctx, false, &indicatif::ProgressBar::hidden()).is_err());
+
+        assert!(dst.is_dir());
+        assert_eq!(list_names(dir.path()), ["a.zip", "a_resized.zip"]);
     }
 }

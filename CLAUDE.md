@@ -33,7 +33,7 @@ cargo fmt                # フォーマット
 1. `spawn_size_check_thread` — zip のファイルサイズ ÷ 内包ファイル数で 1 ファイル平均サイズを求め、**500KB 超のものだけ**を下流に流す（既に十分小さい zip は処理しない）。
 2. `spawn_zip_extraction_thread` — `tempfile::TempDir` に展開。ここだけ `sync_channel(3)` でバックプレッシャーをかけ、一時ディレクトリが際限なく溜まるのを防いでいる。
 3. `spawn_image_resizing_thread` — 展開ファイルを rayon で並列にリサイズ。**1 枚も変換されなかった zip は下流に送らない**（＝出力ファイルを作らない）。
-4. `spawn_zip_creation_thread` — 一旦 `tempfile::tempfile()` に zip を書き、完了後に本来の出力先へコピーする（途中終了時に壊れた zip を残さないため）。
+4. `spawn_zip_creation_thread` — 出力先と同じディレクトリの一時ファイル（`*.zip.tmp`）に zip を書き、完了後に rename（`persist`）で出力先へ置き換える（途中で失敗・中断しても、書きかけの zip が出力先に現れず、既存のファイルも壊さないため）。置き換え前に `sync_all` する（電源断時に既存の出力が空ファイルに置き換わるのを防ぐ）。一時ファイルは既定で 0600 になるので、umask に従うパーミッションを明示している。失敗時の一時ファイルは drop で消えるが、Ctrl-C などの強制終了時は `.a_resized.zip.XXXXXX.tmp` が残る（展開用の一時ディレクトリが /tmp に残るのと同様、許容している）。
 
 `ProcessingContext` が段間で受け渡される単位で、`TempDir` を所有しているためコンテキストが drop されると展開先も自動削除される。
 
