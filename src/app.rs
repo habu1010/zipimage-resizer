@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use crate::convert::{resize_image_files, ResizeOutcome};
 use crate::fs_util::{self, parent_dir};
@@ -154,8 +154,14 @@ struct Reporter {
 
 impl Reporter {
     fn new() -> Self {
+        // テストでは進捗表示を描画しない（cargo test の出力の途中にバーが描かれるため）
+        let mp = if cfg!(test) {
+            MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+        } else {
+            MultiProgress::new()
+        };
         Self {
-            mp: MultiProgress::new(),
+            mp,
             error_count: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -460,12 +466,17 @@ fn spawn_zip_creation_thread(
 }
 
 pub fn run() -> Result<()> {
+    run_with(Args::parse())
+}
+
+/// 解析済みの引数で処理全体を実行する（テストから CLI と同じ流れで呼べるよう分けている）
+fn run_with(args: Args) -> Result<()> {
     let Args {
         output_dir,
         max_height,
         keep_mtime,
         zipfiles,
-    } = Args::parse();
+    } = args;
 
     // 展開・変換を始める前に出力先を検証する
     // （最終段まで進んでから失敗すると、それまでの処理が無駄になるため）
@@ -516,6 +527,8 @@ pub fn run() -> Result<()> {
 mod tests {
     use std::path::{Path, PathBuf};
 
+    use clap::Parser;
+
     use crate::test_util::{list_names, touch_files};
 
     #[test]
@@ -533,8 +546,6 @@ mod tests {
 
     #[test]
     fn test_args_rejects_zero_max_height() {
-        use clap::Parser;
-
         let parse = |height: &str| super::Args::try_parse_from(["prog", "--max-height", height]);
         assert!(parse("0").is_err());
         assert_eq!(parse("1").unwrap().max_height, 1);
@@ -756,5 +767,135 @@ mod tests {
         // （エラーが一時ファイルを抱えたまま持ち回されない）
         assert!(dst.is_dir());
         assert_eq!(list_names(dir.path()), ["a.zip", "a_resized.zip"]);
+    }
+
+    // ---- CLI と同じ流れで、小さな zip を実際に処理する統合テスト ----
+
+    /// 引数を解析して処理全体を実行する
+    fn run_cli(args: &[&str]) -> anyhow::Result<()> {
+        let args = std::iter::once("zipimage-resizer").chain(args.iter().copied());
+        super::run_with(super::Args::try_parse_from(args).unwrap())
+    }
+
+    /// 圧縮が効かない（サイズの大きい）ノイズ画像を作る
+    fn noise_image(width: u32, height: u32) -> image::RgbImage {
+        let mut state = 0x2545_f491_u32;
+        image::RgbImage::from_fn(width, height, |_, _| {
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            };
+            image::Rgb([next(), next(), next()])
+        })
+    }
+
+    /// `entries`（zip 内のパスと中身）を格納した zip を作る
+    fn write_zip(path: &Path, entries: &[(&str, Vec<u8>)]) {
+        use std::io::Write;
+
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, data) in entries {
+            zw.start_file(*name, options).unwrap();
+            zw.write_all(data).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+
+    /// 画像をエンコードしたバイト列にする
+    fn encode(image: &image::RgbImage, format: image::ImageFormat) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut bytes, format).unwrap();
+        bytes.into_inner()
+    }
+
+    /// 処理対象になる（1 エントリあたりの平均が 500KB を超える）zip を作る
+    fn write_large_zip(path: &Path) {
+        use image::ImageFormat::{Jpeg, Png};
+
+        let image = noise_image(700, 700);
+        let png = encode(&image, Png);
+        write_zip(
+            path,
+            &[
+                ("001.png", png.clone()),
+                ("001.jpg", encode(&image, Jpeg)),
+                ("sub/002.png", png),
+                ("readme.txt", b"not an image".to_vec()),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_run_converts_zip() {
+        use image::GenericImageView;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("book.zip");
+        write_large_zip(&src);
+        let original = std::fs::read(&src).unwrap();
+
+        run_cli(&[src.to_str().unwrap(), "--max-height", "100"]).unwrap();
+
+        // 元の zip は変更されず、_resized を付けた名前で出力される
+        assert_eq!(std::fs::read(&src).unwrap(), original);
+        assert_eq!(list_names(dir.path()), ["book.zip", "book_resized.zip"]);
+
+        // 同名の画像は両方残り（ページ順も保たれ）、画像でないファイルはそのまま
+        let file = std::fs::File::open(dir.path().join("book_resized.zip")).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let names: Vec<_> = archive.file_names().map(str::to_owned).collect();
+        assert_eq!(
+            names,
+            [
+                "001.jpg.webp",
+                "001.png.webp",
+                "readme.txt",
+                "sub/",
+                "sub/002.webp"
+            ]
+        );
+        for name in ["001.jpg.webp", "001.png.webp", "sub/002.webp"] {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut archive.by_name(name).unwrap(), &mut bytes).unwrap();
+            let image = image::load_from_memory(&bytes).unwrap();
+            assert_eq!(image.dimensions(), (100, 100), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_run_skips_small_zip() {
+        // 1 エントリあたりの平均が小さい zip は処理せず、出力も作らない
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("small.zip");
+        write_zip(
+            &src,
+            &[(
+                "001.png",
+                encode(&noise_image(8, 8), image::ImageFormat::Png),
+            )],
+        );
+
+        run_cli(&[src.to_str().unwrap()]).unwrap();
+
+        assert_eq!(list_names(dir.path()), ["small.zip"]);
+    }
+
+    #[test]
+    fn test_run_refuses_to_overwrite_input() {
+        // -d に入力元と同じディレクトリを指定しても、原本を壊さずにエラーで終わる
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("book.zip");
+        write_large_zip(&src);
+        let original = std::fs::read(&src).unwrap();
+
+        let result = run_cli(&[src.to_str().unwrap(), "-d", dir.path().to_str().unwrap()]);
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&src).unwrap(), original);
+        assert_eq!(list_names(dir.path()), ["book.zip"]);
     }
 }
