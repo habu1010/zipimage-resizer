@@ -39,20 +39,34 @@ const MAX_WEBP_SIZE: usize = 1024 * 1024; // 1MB
 /// 分を合わせて、最大で `2 * MAX_PENDING_WORK_DIRS + 3` 個になる。
 const MAX_PENDING_WORK_DIRS: usize = 3;
 
+// 各引数の説明は --help にそのまま表示されるユーザー向けの文言なので、英語で書き、
+// 説明を二重に持たないよう日本語の doc コメントは付けない。
 #[derive(Parser, Debug)]
+#[clap(about = "Shrink the images in zip archives by re-encoding them to WebP")]
 struct Args {
-    /// 出力先ディレクトリ
-    #[clap(short = 'd', long)]
+    #[clap(
+        short = 'd',
+        long,
+        help = "Output directory. If omitted, each output is written next to its input \
+                with \"_resized\" added before the extension (e.g. a.zip -> a_resized.zip)"
+    )]
     output_dir: Option<PathBuf>,
 
-    /// 画像の高さの上限（これより高い画像は、縦横比を保ってこの高さまで縮小する）
-    #[clap(long, default_value = "1800")]
+    #[clap(
+        long,
+        default_value = "1800",
+        help = "Maximum image height; taller images are scaled down to this height"
+    )]
     max_height: u32,
 
-    /// 最終更新日時を保持する
-    #[clap(short, long)]
+    #[clap(
+        short,
+        long,
+        help = "Set the modification time of each output to that of its input"
+    )]
     keep_mtime: bool,
 
+    #[clap(help = "Zip files to process")]
     zipfiles: Vec<PathBuf>,
 }
 

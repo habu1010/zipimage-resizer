@@ -10,7 +10,7 @@ zip でまとめられた画像（電子書籍・漫画アーカイブを想定�
 zipimage-resizer [-d 出力先ディレクトリ] [--max-height 1800] [-k|--keep-mtime] <zipfile>...
 ```
 
-- `-d/--output_dir` 未指定時は、元ファイル名に `_resized` サフィックスを付けたパスへ出力する（`determine_output_path`）。
+- `-d/--output-dir` 未指定時は、元ファイル名に `_resized` サフィックスを付けたパスへ出力する（`determine_output_path`）。
 - `-k/--keep-mtime` で出力 zip の最終更新日時を元ファイルに合わせる。
 
 ## 開発コマンド
