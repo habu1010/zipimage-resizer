@@ -29,10 +29,14 @@ fn natural_webp_name(src: &Path) -> OsString {
 /// 衝突する場合の変換後のファイル名の候補を優先順に返す
 ///
 /// `001.png` → `001.png.webp`, `001.png.1.webp`, `001.png.2.webp`, …
+/// 拡張子のない `001` → `001.1.webp`, `001.2.webp`, …
 fn fallback_webp_names(src: &Path) -> impl Iterator<Item = OsString> {
     let name = src.file_name().unwrap().to_os_string();
+    // 拡張子のない `001` では `001.webp` が衝突しないときの名前と同じになり、衝突を避けたことに
+    // ならないので、連番から始める（`001.1.webp`, `001.2.webp`, …）
+    let start = if src.extension().is_none() { 1 } else { 0 };
 
-    (0..).map(move |n| {
+    (start..).map(move |n| {
         let mut candidate = name.clone();
         if n > 0 {
             candidate.push(format!(".{n}"));
@@ -50,7 +54,8 @@ fn fallback_webp_names(src: &Path) -> impl Iterator<Item = OsString> {
 ///
 /// 変換されたファイル同士が衝突する場合は、全員を元の拡張子を残した名前にする。
 /// 片方だけを `001.webp` にすると、`001.png.webp` < `001.webp` の順に並んで
-/// ページ順が逆転するため。
+/// ページ順が逆転するため。拡張子のない `001` と `001.png` の場合は、`001.1.webp` と
+/// `001.png.webp` にする。
 ///
 /// 実際に変換されたファイルだけを対象に、ディレクトリ内に実在する名前
 /// （ディレクトリも含む）と照合して決める。パス順に割り当てるので、
@@ -133,6 +138,12 @@ mod tests {
             candidates,
             ["001.png.webp", "001.png.1.webp", "001.png.2.webp"]
         );
+
+        // 拡張子がない場合は、衝突しないときの名前（001.webp）を候補に含めない
+        let candidates: Vec<_> = super::fallback_webp_names(Path::new("/d/001"))
+            .take(2)
+            .collect();
+        assert_eq!(candidates, ["001.1.webp", "001.2.webp"]);
     }
 
     #[test]
@@ -165,6 +176,31 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.path().join("001.png.webp")).unwrap(),
             b"existing"
+        );
+    }
+
+    #[test]
+    fn test_rename_to_final_names_without_extension() {
+        // 拡張子のない画像と衝突しても、ページ順（001 → 001.png）が逆転しない名前にする
+        let dir = tempfile::tempdir().unwrap();
+        let tmp_noext = dir.path().join("a.webp.tmp");
+        let tmp_png = dir.path().join("b.webp.tmp");
+        std::fs::write(&tmp_noext, b"noext").unwrap();
+        std::fs::write(&tmp_png, b"png").unwrap();
+
+        super::rename_to_final_names(
+            vec![
+                (dir.path().join("001"), tmp_noext),
+                (dir.path().join("001.png"), tmp_png),
+            ],
+            dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(list_names(dir.path()), ["001.1.webp", "001.png.webp"]);
+        assert_eq!(
+            std::fs::read(dir.path().join("001.1.webp")).unwrap(),
+            b"noext"
         );
     }
 }
