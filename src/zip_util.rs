@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use indicatif::ProgressBar;
@@ -127,7 +128,10 @@ pub fn zip_with_progress<P1: AsRef<Path>>(
     dst_file: &File,
     pb: ProgressBar,
 ) -> std::io::Result<()> {
-    let mut zw = zip::ZipWriter::new(dst_file);
+    // ZipWriter は小さな書き込み（ヘッダやコピー時の 8KB 単位の書き込み）を大量に行うため、
+    // バッファしてシステムコールの回数を減らす
+    const WRITE_BUF_SIZE: usize = 1024 * 1024; // 1MB（変換後の WebP 1 枚がほぼ 1 回の書き込みに収まる）
+    let mut zw = zip::ZipWriter::new(BufWriter::with_capacity(WRITE_BUF_SIZE, dst_file));
 
     let file_count =
         fs_util::scan_regular_files(&src_dir).try_fold(0u64, |n, file| file.map(|_| n + 1))?;
@@ -136,7 +140,8 @@ pub fn zip_with_progress<P1: AsRef<Path>>(
 
     zip_process_dir(&mut zw, &src_dir, src_dir.as_ref(), &pb)?;
 
-    zw.finish()?;
+    // drop 任せにすると書き込みエラーが無視されるので、明示的に flush する
+    zw.finish()?.flush()?;
 
     Ok(())
 }
@@ -144,6 +149,30 @@ pub fn zip_with_progress<P1: AsRef<Path>>(
 #[cfg(test)]
 mod tests {
     use indicatif::ProgressBar;
+
+    #[test]
+    fn test_zip_with_progress() {
+        // 作成した zip を読み戻し、エントリの順序・中身・圧縮方式を確認する
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("a.webp"), b"image").unwrap();
+        std::fs::write(dir.path().join("sub/b.txt"), b"text").unwrap();
+
+        let dst = tempfile::tempfile().unwrap();
+        super::zip_with_progress(dir.path(), &dst, ProgressBar::hidden()).unwrap();
+
+        let mut archive = zip::ZipArchive::new(&dst).unwrap();
+        let names: Vec<_> = archive.file_names().map(str::to_owned).collect();
+        assert_eq!(names, ["a.webp", "sub/", "sub/b.txt"]);
+        for (name, content, method) in [
+            ("a.webp", "image", zip::CompressionMethod::Stored),
+            ("sub/b.txt", "text", zip::CompressionMethod::Deflated),
+        ] {
+            let entry = archive.by_name(name).unwrap();
+            assert_eq!(entry.compression(), method, "{name}");
+            assert_eq!(std::io::read_to_string(entry).unwrap(), content);
+        }
+    }
 
     // 読めないディレクトリがあれば、中のファイルを抜かした zip を作らずにエラーにする。
     // zip_with_progress は件数を数える時点でエラーを返すため、zip_process_dir 単体でも確認する
