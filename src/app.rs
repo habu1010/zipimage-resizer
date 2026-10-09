@@ -666,22 +666,6 @@ mod tests {
         );
     }
 
-    /// 小さい画像を書き出す（形式は拡張子で決まる。WebP は変換対象外になるサイズ）
-    fn write_image(path: &Path) {
-        use crate::image_util::ToWebPMemory;
-
-        let img = image::RgbImage::from_pixel(8, 8, image::Rgb([255, 0, 0]));
-        if path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("webp"))
-        {
-            let webp = image::DynamicImage::ImageRgb8(img).to_webp(1024).unwrap();
-            std::fs::write(path, webp.as_ref()).unwrap();
-        } else {
-            img.save(path).unwrap();
-        }
-    }
-
     /// ディレクトリ直下のエントリ名をソートして返す
     fn list_names(dir: &Path) -> Vec<String> {
         let mut names: Vec<_> = std::fs::read_dir(dir)
@@ -694,7 +678,8 @@ mod tests {
 
     /// `files` を作成して変換し、変換件数と変換後のエントリ名を返す
     ///
-    /// 末尾が `/` ならディレクトリ、`.db` なら画像でないファイル、それ以外は画像として作成する
+    /// 末尾が `/` ならディレクトリ、`.db` なら画像でないファイル、`anim` で始まれば
+    /// アニメーション GIF、それ以外は静止画として作成する
     fn resize_files_in_tempdir(files: &[&str]) -> (usize, Vec<String>) {
         let dir = tempfile::tempdir().unwrap();
         for file in files {
@@ -703,8 +688,10 @@ mod tests {
                 std::fs::create_dir(&path).unwrap();
             } else if file.ends_with(".db") {
                 std::fs::write(&path, b"not an image").unwrap();
+            } else if file.starts_with("anim") {
+                crate::test_util::write_animated_gif(&path);
             } else {
-                write_image(&path);
+                crate::test_util::write_image(&path);
             }
         }
 
@@ -739,17 +726,9 @@ mod tests {
     #[test]
     fn test_resize_image_files_keeps_animated_gif() {
         // アニメーション GIF は変換せずにそのまま残し、静止画の GIF は変換する
-        let dir = tempfile::tempdir().unwrap();
-        crate::image_util::tests::write_animated_gif(&dir.path().join("anim.gif"));
-        write_image(&dir.path().join("still.gif"));
-
-        let files: Vec<PathBuf> = crate::fs_util::scan_regular_files(dir.path())
-            .collect::<std::io::Result<_>>()
-            .unwrap();
-        let resized =
-            super::resize_image_files(&files, 1800, indicatif::ProgressBar::hidden()).unwrap();
+        let (resized, names) = resize_files_in_tempdir(&["anim.gif", "still.gif"]);
         assert_eq!(resized, 1);
-        assert_eq!(list_names(dir.path()), ["anim.gif", "still.webp"]);
+        assert_eq!(names, ["anim.gif", "still.webp"]);
     }
 
     #[test]

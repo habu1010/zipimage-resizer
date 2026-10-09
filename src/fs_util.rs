@@ -17,33 +17,7 @@ pub fn scan_regular_files<P: AsRef<Path>>(
 }
 
 #[cfg(test)]
-pub mod tests {
-    use std::path::Path;
-
-    /// `dir` に読み取り権限のないサブディレクトリを作る
-    ///
-    /// root で実行しているなどで権限を無視して読めてしまう場合は `None` を返す
-    /// （呼び出し側はテストをスキップする）。戻り値を drop すると権限を戻す。
-    #[cfg(unix)]
-    pub fn unreadable_subdir(dir: &Path) -> Option<impl Drop> {
-        use std::os::unix::fs::PermissionsExt;
-
-        struct Restore(std::path::PathBuf);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                // TempDir が削除できるよう権限を戻す
-                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
-            }
-        }
-
-        let sub = dir.join("sub");
-        std::fs::create_dir(&sub).unwrap();
-        // 途中で panic しても権限が戻るよう、権限を変える前にガードを作る
-        let restore = Restore(sub.clone());
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
-        std::fs::read_dir(&sub).is_err().then_some(restore)
-    }
-
+mod tests {
     #[test]
     fn test_scan_regular_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -66,7 +40,7 @@ pub mod tests {
     fn test_scan_regular_files_reports_error() {
         // 読めないディレクトリがあれば、黙って飛ばさずにエラーを返す
         let dir = tempfile::tempdir().unwrap();
-        let Some(_restore) = unreadable_subdir(dir.path()) else {
+        let Some(_restore) = crate::test_util::unreadable_subdir(dir.path()) else {
             return;
         };
         assert!(super::scan_regular_files(dir.path()).any(|r| r.is_err()));

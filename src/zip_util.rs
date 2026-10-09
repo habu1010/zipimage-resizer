@@ -152,7 +152,7 @@ mod tests {
     #[cfg(unix)]
     fn test_zip_with_progress_reports_unreadable_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let Some(_restore) = crate::fs_util::tests::unreadable_subdir(dir.path()) else {
+        let Some(_restore) = crate::test_util::unreadable_subdir(dir.path()) else {
             return;
         };
 
@@ -165,7 +165,7 @@ mod tests {
     #[cfg(unix)]
     fn test_zip_process_dir_reports_unreadable_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let Some(_restore) = crate::fs_util::tests::unreadable_subdir(dir.path()) else {
+        let Some(_restore) = crate::test_util::unreadable_subdir(dir.path()) else {
             return;
         };
 

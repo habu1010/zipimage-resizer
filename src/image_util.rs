@@ -106,7 +106,7 @@ impl ToWebPMemory for image::DynamicImage {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use super::ToWebPMemory;
     use image::{DynamicImage, GenericImageView};
 
@@ -171,73 +171,49 @@ pub mod tests {
         );
     }
 
-    /// 2 フレームのアニメーション GIF を書き出す
-    pub fn write_animated_gif(path: &std::path::Path) {
-        let file = std::fs::File::create(path).unwrap();
-        let mut encoder = image::codecs::gif::GifEncoder::new(file);
-        let frames = [image::Rgba([255, 0, 0, 255]), image::Rgba([0, 0, 255, 255])]
-            .map(|color| image::Frame::new(image::RgbaImage::from_pixel(8, 8, color)));
-        encoder.encode_frames(frames).unwrap();
+    /// `dir` 内の `name` をアニメーションと判定するか（形式は拡張子から決める）
+    fn is_animated(dir: &tempfile::TempDir, name: &str) -> bool {
+        let path = dir.path().join(name);
+        let format = image::ImageFormat::from_path(&path).ok();
+        super::is_animated(&path, format)
     }
 
     #[test]
-    fn test_is_animated() {
-        use image::ImageFormat;
+    fn test_is_animated_gif() {
+        use crate::test_util::{write_animated_gif, write_image};
 
+        // 2 フレーム以上ならアニメーション
         let dir = tempfile::tempdir().unwrap();
-        let path = |name: &str| dir.path().join(name);
-        let still = image::RgbImage::from_pixel(8, 8, image::Rgb([255, 0, 0]));
+        write_animated_gif(&dir.path().join("anim.gif"));
+        write_image(&dir.path().join("still.gif"));
+        assert!(is_animated(&dir, "anim.gif"));
+        assert!(!is_animated(&dir, "still.gif"));
 
-        // GIF: 2 フレーム以上ならアニメーション
-        write_animated_gif(&path("anim.gif"));
-        still.save(path("still.gif")).unwrap();
-        assert!(super::is_animated(
-            &path("anim.gif"),
-            Some(ImageFormat::Gif)
-        ));
-        assert!(!super::is_animated(
-            &path("still.gif"),
-            Some(ImageFormat::Gif)
-        ));
         // 末尾が壊れた静止画 GIF（2 フレーム目の読み取りがエラーになる）は静止画扱い
-        let mut broken = std::fs::read(path("still.gif")).unwrap();
+        let mut broken = std::fs::read(dir.path().join("still.gif")).unwrap();
         assert_eq!(broken.pop(), Some(0x3B)); // 終端（Trailer）を取り除く
         broken.extend([0x2C, 0x00]); // 途中で切れたイメージディスクリプタ
-        std::fs::write(path("broken.gif"), broken).unwrap();
-        assert!(!super::is_animated(
-            &path("broken.gif"),
-            Some(ImageFormat::Gif)
-        ));
+        std::fs::write(dir.path().join("broken.gif"), broken).unwrap();
+        assert!(!is_animated(&dir, "broken.gif"));
+    }
 
-        // WebP
-        let config = webp::WebPConfig::new().unwrap();
-        let mut encoder = webp::AnimEncoder::new(8, 8, &config);
-        let frames = [[255, 0, 0, 255], [0, 0, 255, 255]].map(|color| {
-            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(8, 8, image::Rgba(color)))
-        });
-        for (i, frame) in frames.iter().enumerate() {
-            encoder.add_frame(webp::AnimFrame::from_image(frame, i as i32 * 100).unwrap());
-        }
-        std::fs::write(path("anim.webp"), &*encoder.encode()).unwrap();
-        let webp = image::DynamicImage::ImageRgb8(still.clone())
-            .to_webp(1024)
-            .unwrap();
-        std::fs::write(path("still.webp"), &*webp).unwrap();
-        assert!(super::is_animated(
-            &path("anim.webp"),
-            Some(ImageFormat::WebP)
-        ));
-        assert!(!super::is_animated(
-            &path("still.webp"),
-            Some(ImageFormat::WebP)
-        ));
+    #[test]
+    fn test_is_animated_webp() {
+        use crate::test_util::{write_animated_webp, write_image};
 
-        // PNG（APNG は作れないので静止画のみ確認）
-        still.save(path("still.png")).unwrap();
-        assert!(!super::is_animated(
-            &path("still.png"),
-            Some(ImageFormat::Png)
-        ));
+        let dir = tempfile::tempdir().unwrap();
+        write_animated_webp(&dir.path().join("anim.webp"));
+        write_image(&dir.path().join("still.webp"));
+        assert!(is_animated(&dir, "anim.webp"));
+        assert!(!is_animated(&dir, "still.webp"));
+    }
+
+    #[test]
+    fn test_is_animated_png() {
+        // APNG はテスト用に作れないので、静止画の PNG のみ確認する
+        let dir = tempfile::tempdir().unwrap();
+        crate::test_util::write_image(&dir.path().join("still.png"));
+        assert!(!is_animated(&dir, "still.png"));
     }
 
     /// WebP に変換してからデコードし直す
