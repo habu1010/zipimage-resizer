@@ -10,8 +10,9 @@ pub trait ReduceSize {
 impl ReduceSize for image::DynamicImage {
     fn reduce_size(self, height: u32) -> Self {
         use image::imageops::FilterType::*;
+        // 高さがちょうど閾値と同じ画像は、同じサイズへの無駄なリサンプリングになるので除く
         match self.dimensions() {
-            (_, h) if h >= height => self.resize(u32::MAX, height, Lanczos3),
+            (_, h) if h > height => self.resize(u32::MAX, height, Lanczos3),
             _ => self,
         }
     }
@@ -52,6 +53,18 @@ impl ToWebPMemory for image::DynamicImage {
 mod tests {
     use super::ToWebPMemory;
     use image::{DynamicImage, GenericImageView};
+
+    #[test]
+    fn test_reduce_size() {
+        use super::ReduceSize;
+
+        // 閾値より高い画像だけを、縦横比を保って縮小する
+        let image = DynamicImage::new_rgb8(200, 400).reduce_size(100);
+        assert_eq!(image.dimensions(), (50, 100));
+        // 閾値以下の画像はそのまま
+        let image = DynamicImage::new_rgb8(200, 100).reduce_size(100);
+        assert_eq!(image.dimensions(), (200, 100));
+    }
 
     /// WebP に変換してからデコードし直す
     fn roundtrip(image: DynamicImage) -> DynamicImage {
