@@ -90,6 +90,10 @@ fn resize_image_file_webp(src: &Path, min_height: u32) -> Result<Option<PathBuf>
     if reader.format() == Some(WebP) && src.metadata()?.len() < MAX_WEBP_SIZE as u64 {
         return Ok(None);
     }
+    // 静止画の WebP にすると先頭フレーム以外が失われるので、そのまま残す
+    if image_util::is_animated(src, reader.format()) {
+        return Ok(None);
+    }
 
     let Ok(image) = image_util::decode_with_orientation(reader) else {
         return Ok(None);
@@ -730,6 +734,22 @@ mod tests {
             names,
             ["001.png.webp", "001.webp", "002.WEBP", "002.png.webp"]
         );
+    }
+
+    #[test]
+    fn test_resize_image_files_keeps_animated_gif() {
+        // アニメーション GIF は変換せずにそのまま残し、静止画の GIF は変換する
+        let dir = tempfile::tempdir().unwrap();
+        crate::image_util::tests::write_animated_gif(&dir.path().join("anim.gif"));
+        write_image(&dir.path().join("still.gif"));
+
+        let files: Vec<PathBuf> = crate::fs_util::scan_regular_files(dir.path())
+            .collect::<std::io::Result<_>>()
+            .unwrap();
+        let resized =
+            super::resize_image_files(&files, 1800, indicatif::ProgressBar::hidden()).unwrap();
+        assert_eq!(resized, 1);
+        assert_eq!(list_names(dir.path()), ["anim.gif", "still.webp"]);
     }
 
     #[test]

@@ -49,7 +49,7 @@ cargo fmt                # フォーマット
 
 ### 画像変換方針（[src/image_util.rs](src/image_util.rs), `resize_image_file_webp`）
 
-- 変換対象外の判定: 既に WebP かつ 1MB 未満のファイルはスキップ（戻り値 `false`）。デコードに失敗したファイル（画像でないもの）も無視して `false` を返し、処理は継続する。
+- 変換対象外の判定: 既に WebP かつ 1MB 未満のファイルと、アニメーション画像（アニメーション GIF / APNG / アニメーション WebP。`image_util::is_animated`）はスキップする（戻り値 `None`）。静止画の WebP にすると先頭フレーム以外が失われるため。デコードに失敗したファイル（画像でないもの）も無視して `None` を返し、処理は継続する。
 - デコードは `image_util::decode_with_orientation` で行い、EXIF の向き（Orientation）を画素に反映する（WebP には元の EXIF を引き継がないため）。
 - `ReduceSize::reduce_size` は高さが閾値を超えるときだけ Lanczos3 で縮小する（拡大はしない。ちょうど閾値と同じ高さの画像もそのまま）。
 - `ToWebPMemory::to_webp` は品質 95 → 85 → … → 15 と下げながらエンコードし、**1MB 以下に収まった最初の結果**を採用する。全滅時は品質 10 で確定。

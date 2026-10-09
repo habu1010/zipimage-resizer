@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::io::{BufRead, Seek};
+use std::path::Path;
 
 use anyhow::Result;
 use image::metadata::Orientation;
@@ -18,6 +19,41 @@ impl ReduceSize for image::DynamicImage {
             _ => self,
         }
     }
+}
+
+/// アニメーション画像（アニメーション GIF / APNG / アニメーション WebP）かどうかを判定する
+///
+/// 静止画の WebP に変換すると先頭フレーム以外が失われるため、変換対象外にするのに使う。
+/// 判定できない（壊れているなど）場合は `false` を返し、通常のデコードの判定に任せる。
+pub fn is_animated(path: &Path, format: Option<image::ImageFormat>) -> bool {
+    use image::codecs::{gif::GifDecoder, png::PngDecoder, webp::WebPDecoder};
+    use image::ImageFormat;
+
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let reader = std::io::BufReader::new(file);
+    match format {
+        // GIF はヘッダに目印がないため、2 フレーム目があるかで判定する
+        Some(ImageFormat::Gif) => GifDecoder::new(reader).is_ok_and(has_multiple_frames),
+        // APNG でもフレームが 1 枚だけなら実質は静止画なので、実際に 2 フレームあるかを確かめる
+        // （フレームを読むのは APNG の場合だけなので、通常の PNG では追加の処理は走らない）
+        Some(ImageFormat::Png) => PngDecoder::new(reader).is_ok_and(|decoder| {
+            decoder.is_apng().unwrap_or(false) && decoder.apng().is_ok_and(has_multiple_frames)
+        }),
+        Some(ImageFormat::WebP) => {
+            WebPDecoder::new(reader).is_ok_and(|decoder| decoder.has_animation())
+        }
+        _ => false,
+    }
+}
+
+/// 正常に読めるフレームが 2 枚以上あるかどうか
+///
+/// 読み取りエラーはフレームとして数えない（末尾が壊れた静止画を誤判定しないため）。
+fn has_multiple_frames<'a>(decoder: impl image::AnimationDecoder<'a>) -> bool {
+    let frames = decoder.into_frames().take(2);
+    frames.filter(|frame| frame.is_ok()).count() > 1
 }
 
 /// 画像をデコードし、EXIF の向き（Orientation）を適用する
@@ -70,7 +106,7 @@ impl ToWebPMemory for image::DynamicImage {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::ToWebPMemory;
     use image::{DynamicImage, GenericImageView};
 
@@ -133,6 +169,75 @@ mod tests {
             decode(jpeg_with_orientation(40, 20, 1)).dimensions(),
             (40, 20)
         );
+    }
+
+    /// 2 フレームのアニメーション GIF を書き出す
+    pub fn write_animated_gif(path: &std::path::Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut encoder = image::codecs::gif::GifEncoder::new(file);
+        let frames = [image::Rgba([255, 0, 0, 255]), image::Rgba([0, 0, 255, 255])]
+            .map(|color| image::Frame::new(image::RgbaImage::from_pixel(8, 8, color)));
+        encoder.encode_frames(frames).unwrap();
+    }
+
+    #[test]
+    fn test_is_animated() {
+        use image::ImageFormat;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name);
+        let still = image::RgbImage::from_pixel(8, 8, image::Rgb([255, 0, 0]));
+
+        // GIF: 2 フレーム以上ならアニメーション
+        write_animated_gif(&path("anim.gif"));
+        still.save(path("still.gif")).unwrap();
+        assert!(super::is_animated(
+            &path("anim.gif"),
+            Some(ImageFormat::Gif)
+        ));
+        assert!(!super::is_animated(
+            &path("still.gif"),
+            Some(ImageFormat::Gif)
+        ));
+        // 末尾が壊れた静止画 GIF（2 フレーム目の読み取りがエラーになる）は静止画扱い
+        let mut broken = std::fs::read(path("still.gif")).unwrap();
+        assert_eq!(broken.pop(), Some(0x3B)); // 終端（Trailer）を取り除く
+        broken.extend([0x2C, 0x00]); // 途中で切れたイメージディスクリプタ
+        std::fs::write(path("broken.gif"), broken).unwrap();
+        assert!(!super::is_animated(
+            &path("broken.gif"),
+            Some(ImageFormat::Gif)
+        ));
+
+        // WebP
+        let config = webp::WebPConfig::new().unwrap();
+        let mut encoder = webp::AnimEncoder::new(8, 8, &config);
+        let frames = [[255, 0, 0, 255], [0, 0, 255, 255]].map(|color| {
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(8, 8, image::Rgba(color)))
+        });
+        for (i, frame) in frames.iter().enumerate() {
+            encoder.add_frame(webp::AnimFrame::from_image(frame, i as i32 * 100).unwrap());
+        }
+        std::fs::write(path("anim.webp"), &*encoder.encode()).unwrap();
+        let webp = image::DynamicImage::ImageRgb8(still.clone())
+            .to_webp(1024)
+            .unwrap();
+        std::fs::write(path("still.webp"), &*webp).unwrap();
+        assert!(super::is_animated(
+            &path("anim.webp"),
+            Some(ImageFormat::WebP)
+        ));
+        assert!(!super::is_animated(
+            &path("still.webp"),
+            Some(ImageFormat::WebP)
+        ));
+
+        // PNG（APNG は作れないので静止画のみ確認）
+        still.save(path("still.png")).unwrap();
+        assert!(!super::is_animated(
+            &path("still.png"),
+            Some(ImageFormat::Png)
+        ));
     }
 
     /// WebP に変換してからデコードし直す
