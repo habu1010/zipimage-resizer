@@ -83,3 +83,16 @@ pub fn list_names(dir: &Path) -> Vec<String> {
     names.sort();
     names
 }
+
+/// `files` を空ファイルとして作成し（親ディレクトリも作る）、そのパスを返す
+pub fn touch_files(dir: &Path, files: &[&str]) -> Vec<std::path::PathBuf> {
+    files
+        .iter()
+        .map(|file| {
+            let path = dir.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"").unwrap();
+            path
+        })
+        .collect()
+}

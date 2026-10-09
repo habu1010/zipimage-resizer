@@ -6,8 +6,6 @@ use anyhow::Context;
 use indicatif::ProgressBar;
 use ripunzip::{UnzipEngine, UnzipOptions, UnzipProgressReporter};
 
-use crate::fs_util;
-
 struct UnzipProgressBar(ProgressBar);
 
 impl UnzipProgressReporter for UnzipProgressBar {
@@ -76,45 +74,44 @@ fn relative_path<'a>(path: &'a Path, base_dir: &Path) -> std::borrow::Cow<'a, st
     path.strip_prefix(base_dir).unwrap().to_string_lossy()
 }
 
-fn zip_process_dir<W, P>(
+/// `src_dir` 以下のファイルとディレクトリを `zw` に追加する
+///
+/// 1 回の走査で全エントリを集め、件数を進捗表示に使ってから追加する。
+/// エントリの順序は、各ディレクトリで「ファイル（名前順）→ サブディレクトリ（名前順）」の
+/// 深さ優先にする（ディレクトリの直後にその中身が続く）。
+fn add_dir_to_zip<W>(
     zw: &mut zip::ZipWriter<W>,
-    dir: P,
-    base_dir: &Path,
+    src_dir: &Path,
     pb: &ProgressBar,
 ) -> anyhow::Result<()>
 where
     W: std::io::Write + std::io::Seek,
-    P: AsRef<Path>,
 {
     // 走査エラーを無視すると、そのファイルが黙って zip から抜け落ちるのでエラーにする
-    let entries = walkdir::WalkDir::new(&dir)
-        .max_depth(1)
-        .sort_by_file_name()
+    let entries = walkdir::WalkDir::new(src_dir)
+        .min_depth(1)
+        .sort_by(|a, b| {
+            (a.file_type().is_dir(), a.file_name()).cmp(&(b.file_type().is_dir(), b.file_name()))
+        })
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
 
-    for file in entries.iter().filter(|e| e.file_type().is_file()) {
-        let path = file.path();
-        let filepath = relative_path(path, base_dir);
+    let file_count = entries.iter().filter(|e| e.file_type().is_file()).count();
+    pb.set_position(0);
+    pb.set_length(file_count as u64);
 
-        pb.inc(1);
-
-        let options = get_options(path);
-
-        let mut file =
-            std::fs::File::open(path).with_context(|| format!("failed to read {filepath}"))?;
-        zw.start_file(filepath, options)?;
-        std::io::copy(&mut file, zw)?;
-    }
-
-    for dir_entry in entries
-        .iter()
-        .filter(|e| e.file_type().is_dir() && e.path() != dir.as_ref())
-    {
-        let path = dir_entry.path();
-        let filepath = relative_path(path, base_dir);
-        zw.add_directory(filepath, zip::write::SimpleFileOptions::default())?;
-        zip_process_dir(zw, path, base_dir, pb)?;
+    for entry in &entries {
+        let path = entry.path();
+        let filepath = relative_path(path, src_dir);
+        if entry.file_type().is_dir() {
+            zw.add_directory(filepath, zip::write::SimpleFileOptions::default())?;
+        } else if entry.file_type().is_file() {
+            pb.inc(1);
+            let mut file =
+                std::fs::File::open(path).with_context(|| format!("failed to read {filepath}"))?;
+            zw.start_file(filepath, get_options(path))?;
+            std::io::copy(&mut file, zw)?;
+        }
     }
 
     Ok(())
@@ -135,12 +132,7 @@ pub fn zip_with_progress<P1: AsRef<Path>>(
     const WRITE_BUF_SIZE: usize = 1024 * 1024; // 1MB（変換後の WebP 1 枚がほぼ 1 回の書き込みに収まる）
     let mut zw = zip::ZipWriter::new(BufWriter::with_capacity(WRITE_BUF_SIZE, dst_file));
 
-    let file_count =
-        fs_util::scan_regular_files(&src_dir).try_fold(0u64, |n, file| file.map(|_| n + 1))?;
-    pb.set_position(0);
-    pb.set_length(file_count);
-
-    zip_process_dir(&mut zw, &src_dir, src_dir.as_ref(), &pb)?;
+    add_dir_to_zip(&mut zw, src_dir.as_ref(), &pb)?;
 
     // drop 任せにすると書き込みエラーが無視されるので、明示的に flush する
     zw.finish()?.flush()?;
@@ -176,9 +168,7 @@ mod tests {
         }
     }
 
-    // 読めないディレクトリがあれば、中のファイルを抜かした zip を作らずにエラーにする。
-    // zip_with_progress は件数を数える時点でエラーを返すため、zip_process_dir 単体でも確認する
-
+    // 読めないディレクトリがあれば、中のファイルを抜かした zip を作らずにエラーにする
     #[test]
     #[cfg(unix)]
     fn test_zip_with_progress_reports_unreadable_dir() {
@@ -193,16 +183,39 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
-    fn test_zip_process_dir_reports_unreadable_dir() {
+    fn test_zip_with_progress_entry_order() {
+        // 各ディレクトリで「ファイル（名前順）→ サブディレクトリ（名前順）」の深さ優先になる
         let dir = tempfile::tempdir().unwrap();
-        let Some(_restore) = crate::test_util::unreadable_subdir(dir.path()) else {
-            return;
-        };
+        crate::test_util::touch_files(
+            dir.path(),
+            &[
+                "z.png",
+                "b.webp",
+                "a/x.txt",
+                "a/b/y.txt",
+                "c/z.txt",
+                "a/0.txt",
+            ],
+        );
 
-        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        let result =
-            super::zip_process_dir(&mut zw, dir.path(), dir.path(), &ProgressBar::hidden());
-        assert!(result.is_err());
+        let dst = tempfile::tempfile().unwrap();
+        super::zip_with_progress(dir.path(), &dst, ProgressBar::hidden()).unwrap();
+
+        let archive = zip::ZipArchive::new(&dst).unwrap();
+        let names: Vec<_> = archive.file_names().collect();
+        assert_eq!(
+            names,
+            [
+                "b.webp",
+                "z.png",
+                "a/",
+                "a/0.txt",
+                "a/x.txt",
+                "a/b/",
+                "a/b/y.txt",
+                "c/",
+                "c/z.txt"
+            ]
+        );
     }
 }

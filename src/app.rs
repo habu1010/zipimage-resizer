@@ -516,7 +516,7 @@ pub fn run() -> Result<()> {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use crate::test_util::list_names;
+    use crate::test_util::{list_names, touch_files};
 
     #[test]
     fn test_append_suffix_to_filename() {
@@ -574,19 +574,6 @@ mod tests {
              001.png: broken\n  002.png: broken\n  003.png: broken\n  004.png: broken\n  \
              005.png: broken\n  ... and 2 more"
         );
-    }
-
-    /// `files` を空ファイルとして作成し、そのパスを返す
-    fn touch_files(dir: &Path, files: &[&str]) -> Vec<PathBuf> {
-        files
-            .iter()
-            .map(|file| {
-                let path = dir.join(file);
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::fs::write(&path, b"").unwrap();
-                path
-            })
-            .collect()
     }
 
     /// `plan_jobs` を実行し、処理対象の入力とエラー件数を返す
