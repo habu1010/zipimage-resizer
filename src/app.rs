@@ -324,7 +324,7 @@ fn append_suffix_to_filename<P: AsRef<Path>>(path: P, suffix: &str) -> PathBuf {
     path.with_file_name(stem).with_extension(ext)
 }
 
-fn determine_output_path(path: &Path, output_dir: &Option<PathBuf>) -> PathBuf {
+fn determine_output_path(path: &Path, output_dir: Option<&Path>) -> PathBuf {
     match output_dir {
         Some(output_dir) => output_dir.join(path.file_name().unwrap()),
         None => append_suffix_to_filename(path, "_resized"),
@@ -397,7 +397,7 @@ impl Reporter {
 /// 処理しない入力は `Reporter` で報告し、残りの処理は続ける。
 fn plan_jobs(
     zipfiles: Vec<PathBuf>,
-    output_dir: &Option<PathBuf>,
+    output_dir: Option<&Path>,
     reporter: &Reporter,
 ) -> Vec<ZipJob> {
     let mut inputs = Vec::new();
@@ -681,7 +681,7 @@ pub fn run() -> Result<()> {
     }
 
     let reporter = Reporter::new();
-    let jobs = plan_jobs(zipfiles, &output_dir, &reporter);
+    let jobs = plan_jobs(zipfiles, output_dir.as_deref(), &reporter);
 
     let (size_check_handle, size_check_rx) = spawn_size_check_thread(jobs, &reporter);
     let (zip_extraction_handle, zip_extraction_rx) =
@@ -736,11 +736,11 @@ mod tests {
         let src = Path::new("/path1/path2/test.zip");
 
         // 出力先ディレクトリ指定時はファイル名だけを引き継ぐ
-        let path = super::determine_output_path(src, &Some(Path::new("/out").to_path_buf()));
+        let path = super::determine_output_path(src, Some(Path::new("/out")));
         assert_eq!(path, Path::new("/out/test.zip"));
 
         // 未指定時は元ファイル名に _resized を付ける
-        let path = super::determine_output_path(src, &None);
+        let path = super::determine_output_path(src, None);
         assert_eq!(path, Path::new("/path1/path2/test_resized.zip"));
     }
 
@@ -954,7 +954,7 @@ mod tests {
     /// `plan_jobs` を実行し、処理対象の入力とエラー件数を返す
     fn plan(zipfiles: Vec<PathBuf>, output_dir: Option<PathBuf>) -> (Vec<PathBuf>, usize) {
         let reporter = super::Reporter::new();
-        let jobs = super::plan_jobs(zipfiles, &output_dir, &reporter);
+        let jobs = super::plan_jobs(zipfiles, output_dir.as_deref(), &reporter);
         let srcs = jobs.into_iter().map(|job| job.src_file).collect();
         (srcs, reporter.error_count())
     }
@@ -967,7 +967,7 @@ mod tests {
         let zipfiles = touch_files(dir.path(), &["a.zip", "b.zip"]);
 
         let reporter = super::Reporter::new();
-        let jobs = super::plan_jobs(zipfiles.clone(), &Some(out.clone()), &reporter);
+        let jobs = super::plan_jobs(zipfiles.clone(), Some(&out), &reporter);
         assert_eq!(reporter.error_count(), 0);
         assert_eq!(
             jobs,
