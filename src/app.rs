@@ -20,6 +20,17 @@ use crate::fs_util;
 use crate::image_util::{self, ReduceSize, ToWebPMemory};
 use crate::zip_util;
 
+/// 処理対象にする zip の、1 ファイルあたりの平均サイズの下限
+///
+/// 平均がこれ以下の zip は、既に十分小さいとみなして処理しない。
+const MIN_AVERAGE_FILE_SIZE: u64 = 500 * 1024; // 500KB
+
+/// 変換後の WebP の目標サイズ
+///
+/// エンコード時はこのサイズ以下に収まるまで品質を下げる。また、既にこのサイズ未満の
+/// WebP は変換しない。
+const MAX_WEBP_SIZE: usize = 1024 * 1024; // 1MB
+
 /// 展開済み zip（一時ディレクトリ）を受け渡すチャネル 1 本あたりに溜めておける数
 ///
 /// 上限がないと、下流の段が遅いときに展開済みの一時ディレクトリが際限なく溜まり、
@@ -91,8 +102,6 @@ fn resize_image_file_jpg<P: AsRef<Path>>(path: P, max_height: u32) -> image::Ima
 /// 最終的なファイル名は、全ファイルの変換後に `rename_to_final_names` で決める。
 fn resize_image_file_webp(src: &Path, max_height: u32) -> Result<Option<PathBuf>> {
     use image::ImageFormat::*;
-
-    const MAX_WEBP_SIZE: usize = 1024 * 1024; // 1MB
 
     let reader = image::ImageReader::open(src)?.with_guessed_format()?;
     if reader.format() == Some(WebP) && src.metadata()?.len() < MAX_WEBP_SIZE as u64 {
@@ -473,7 +482,7 @@ fn spawn_size_check_thread(
             let zipfile = &job.src_file;
             pb.set_message(zipfile.to_string_lossy().into_owned());
             match calc_average_size_per_file(zipfile) {
-                Ok(size_per_file) if size_per_file > 500 * 1024 => {
+                Ok(size_per_file) if size_per_file > MIN_AVERAGE_FILE_SIZE => {
                     to_convert += 1;
                     tx.send(job)?;
                 }
