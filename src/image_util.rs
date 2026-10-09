@@ -1,7 +1,9 @@
 use std::borrow::Cow;
+use std::io::{BufRead, Seek};
 
 use anyhow::Result;
-use image::GenericImageView;
+use image::metadata::Orientation;
+use image::{GenericImageView, ImageDecoder};
 
 pub trait ReduceSize {
     fn reduce_size(self, height: u32) -> Self;
@@ -16,6 +18,24 @@ impl ReduceSize for image::DynamicImage {
             _ => self,
         }
     }
+}
+
+/// 画像をデコードし、EXIF の向き（Orientation）を適用する
+///
+/// WebP には元の EXIF を引き継がないため、向きを画素に反映しておかないと
+/// 回転情報付きの写真（スキャン画像など）が横倒しのまま出力される。
+pub fn decode_with_orientation<R: BufRead + Seek>(
+    reader: image::ImageReader<R>,
+) -> image::ImageResult<image::DynamicImage> {
+    let mut decoder = reader.into_decoder()?;
+    // 向きの情報が壊れているだけなら、向きを変えずにそのまま使う
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    // ImageReader::decode と同じく、デコード前に必要なメモリ量を見積もって巨大な画像を弾く
+    // （ImageReader の上限はデコーダに引き継がれるが、この事前チェックは既定の上限で行う）
+    image::Limits::default().reserve(decoder.total_bytes())?;
+    let mut image = image::DynamicImage::from_decoder(decoder)?;
+    image.apply_orientation(orientation);
+    Ok(image)
 }
 
 pub trait ToWebPMemory {
@@ -64,6 +84,55 @@ mod tests {
         // 閾値以下の画像はそのまま
         let image = DynamicImage::new_rgb8(200, 100).reduce_size(100);
         assert_eq!(image.dimensions(), (200, 100));
+    }
+
+    /// EXIF の向き（Orientation）を埋め込んだ JPEG を作る
+    fn jpeg_with_orientation(width: u32, height: u32, orientation: u16) -> Vec<u8> {
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        DynamicImage::new_rgb8(width, height)
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .unwrap();
+        let jpeg = jpeg.into_inner();
+
+        // APP1 (Exif): TIFF ヘッダ（リトルエンディアン）+ Orientation タグ 1 つだけの IFD
+        let mut exif = b"Exif\0\0II*\0".to_vec();
+        exif.extend(8u32.to_le_bytes()); // IFD の位置
+        exif.extend(1u16.to_le_bytes()); // エントリ数
+        exif.extend(0x0112u16.to_le_bytes()); // Orientation タグ
+        exif.extend(3u16.to_le_bytes()); // SHORT 型
+        exif.extend(1u32.to_le_bytes()); // 個数
+        exif.extend(orientation.to_le_bytes());
+        exif.extend([0, 0]); // パディング
+        exif.extend(0u32.to_le_bytes()); // 次の IFD なし
+
+        // SOI（先頭 2 バイト）の直後に APP1 セグメントを挿入する
+        let mut result = jpeg[..2].to_vec();
+        result.extend([0xFF, 0xE1]);
+        result.extend((exif.len() as u16 + 2).to_be_bytes());
+        result.extend(exif);
+        result.extend(&jpeg[2..]);
+        result
+    }
+
+    #[test]
+    fn test_decode_with_orientation() {
+        let decode = |jpeg: Vec<u8>| {
+            let reader = image::ImageReader::new(std::io::Cursor::new(jpeg))
+                .with_guessed_format()
+                .unwrap();
+            super::decode_with_orientation(reader).unwrap()
+        };
+
+        // Orientation 6（時計回りに 90 度回転して表示）は縦横が入れ替わる
+        assert_eq!(
+            decode(jpeg_with_orientation(40, 20, 6)).dimensions(),
+            (20, 40)
+        );
+        // Orientation 1（そのまま）は変わらない
+        assert_eq!(
+            decode(jpeg_with_orientation(40, 20, 1)).dimensions(),
+            (40, 20)
+        );
     }
 
     /// WebP に変換してからデコードし直す

@@ -17,7 +17,7 @@ use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressSt
 use rayon::prelude::*;
 
 use crate::fs_util;
-use crate::image_util::{ReduceSize, ToWebPMemory};
+use crate::image_util::{self, ReduceSize, ToWebPMemory};
 use crate::zip_util;
 
 #[derive(Parser, Debug)]
@@ -91,7 +91,7 @@ fn resize_image_file_webp(src: &Path, min_height: u32) -> Result<Option<PathBuf>
         return Ok(None);
     }
 
-    let Ok(image) = reader.decode() else {
+    let Ok(image) = image_util::decode_with_orientation(reader) else {
         return Ok(None);
     };
 
