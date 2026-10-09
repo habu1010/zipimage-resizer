@@ -54,7 +54,9 @@ struct Args {
 
     #[clap(
         long,
-        default_value = "1800",
+        default_value_t = 1800,
+        // 0 を許すと全ページが高さ 1px に潰れ、原本も消えるので弾く
+        value_parser = clap::value_parser!(u32).range(1..),
         help = "Maximum image height; taller images are scaled down to this height"
     )]
     max_height: u32,
@@ -743,6 +745,15 @@ mod tests {
     fn test_append_suffix_to_filename_without_extension() {
         let path = super::append_suffix_to_filename(Path::new("/path1/path2/test"), "_suffix");
         assert_eq!(path, Path::new("/path1/path2/test_suffix"));
+    }
+
+    #[test]
+    fn test_args_rejects_zero_max_height() {
+        use clap::Parser;
+
+        let parse = |height: &str| super::Args::try_parse_from(["prog", "--max-height", height]);
+        assert!(parse("0").is_err());
+        assert_eq!(parse("1").unwrap().max_height, 1);
     }
 
     #[test]
