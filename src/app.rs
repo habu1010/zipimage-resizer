@@ -1,5 +1,5 @@
 use std::{
-    io::Seek,
+    io::{Seek, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -81,10 +81,21 @@ fn resize_image_file_webp<P: AsRef<Path>>(path: P, min_height: u32) -> Result<bo
         return Ok(false);
     };
 
-    std::fs::remove_file(path)?;
-
     let webp = image.reduce_size(min_height).to_webp(MAX_WEBP_SIZE)?;
-    std::fs::write(path.with_extension("webp"), webp.as_ref())?;
+
+    // 書き込みに失敗しても元画像が残るよう、一時ファイルに書き出してから置き換える
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut tmp = tempfile::Builder::new()
+        .suffix(".webp.tmp")
+        .tempfile_in(dir)?;
+    tmp.write_all(webp.as_ref())?;
+
+    let dst = path.with_extension("webp");
+    tmp.persist(&dst)?;
+    // 元が WebP の場合は置き換え済みなので削除しない
+    if dst != path {
+        std::fs::remove_file(path)?;
+    }
 
     Ok(true)
 }
