@@ -15,7 +15,7 @@ use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::convert::{resize_image_files, ResizeOutcome};
-use crate::fs_util::{self, display_in, parent_dir};
+use crate::fs_util::{self, parent_dir};
 use crate::zip_util;
 
 /// 処理対象にする zip の、1 ファイルあたりの平均サイズの下限
@@ -81,7 +81,7 @@ struct ProcessingContext {
 /// 変換に失敗した画像を、zip ごとに 1 件のエラーとしてまとめた文面にする
 ///
 /// ディスクフルなどで大量に失敗しても表示が溢れないよう、個別のファイルは先頭の数件だけ示す。
-/// パスは一時ディレクトリではなく zip 内のパスで示す。
+/// パスは `ResizeOutcome::failed` の zip 内のパスをそのまま示す。
 fn format_conversion_failures(ctx: &ProcessingContext, outcome: &ResizeOutcome) -> String {
     use std::fmt::Write as _;
 
@@ -99,7 +99,7 @@ fn format_conversion_failures(ctx: &ProcessingContext, outcome: &ResizeOutcome) 
     }
     msg.push(':');
     for (file, e) in failed.iter().take(MAX_LISTED) {
-        let _ = write!(msg, "\n  {}: {e:#}", display_in(file, ctx.work_dir.path()));
+        let _ = write!(msg, "\n  {}: {e:#}", file.display());
     }
     if failed.len() > MAX_LISTED {
         let _ = write!(msg, "\n  ... and {} more", failed.len() - MAX_LISTED);
@@ -559,7 +559,7 @@ mod tests {
         let ctx = processing_context(PathBuf::from("book.zip"), PathBuf::from("out.zip"));
         let failed = (1..=7)
             .map(|i| {
-                let file = ctx.work_dir.path().join(format!("{i:03}.png"));
+                let file = PathBuf::from(format!("{i:03}.png"));
                 (file, anyhow::anyhow!("broken"))
             })
             .collect();

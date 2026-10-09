@@ -100,7 +100,8 @@ fn resize_image_file_webp(src: &Path, max_height: u32) -> Result<Option<PathBuf>
 pub struct ResizeOutcome {
     /// 変換できた画像の枚数
     pub converted: usize,
-    /// 変換に失敗した画像とその理由（パス順）。これらの画像は元のまま残っている
+    /// 変換に失敗した画像の zip 内のパス（展開先からの相対パス）とその理由（パス順）。
+    /// これらの画像は元のまま残っている
     pub failed: Vec<(PathBuf, anyhow::Error)>,
 }
 
@@ -131,7 +132,8 @@ pub fn resize_image_files(
         match result {
             Ok(Some(tmp)) => converted.push((src.clone(), tmp)),
             Ok(None) => {}
-            Err(e) => failed.push((src.clone(), e)),
+            // 一時ディレクトリの絶対パスは報告時には消えているので、zip 内のパスにしておく
+            Err(e) => failed.push((src.strip_prefix(base_dir).unwrap_or(src).to_path_buf(), e)),
         }
     }
     failed.sort_by(|(a, _), (b, _)| a.cmp(b));
@@ -225,7 +227,7 @@ mod tests {
         let outcome = resize_dir(dir.path());
         assert_eq!(outcome.converted, 1);
         let failed: Vec<_> = outcome.failed.iter().map(|(file, _)| file).collect();
-        assert_eq!(failed, [&dir.path().join("002.png")]);
+        assert_eq!(failed, [Path::new("002.png")]);
         assert_eq!(list_names(dir.path()), ["001.webp", "002.png"]);
     }
 
@@ -241,7 +243,7 @@ mod tests {
         let outcome = resize_dir(dir.path());
         assert_eq!(outcome.converted, 1);
         let failed: Vec<_> = outcome.failed.iter().map(|(file, _)| file).collect();
-        assert_eq!(failed, [&dir.path().join("002.png")]);
+        assert_eq!(failed, [Path::new("002.png")]);
         assert_eq!(
             list_names(dir.path()),
             ["001.webp", "002.png", "readme.txt"]
