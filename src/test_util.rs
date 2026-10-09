@@ -73,3 +73,13 @@ pub fn write_animated_webp(path: &Path) {
     }
     std::fs::write(path, &*encoder.encode()).unwrap();
 }
+
+/// ディレクトリ直下のエントリ名をソートして返す
+pub fn list_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}

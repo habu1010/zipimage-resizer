@@ -26,6 +26,16 @@ cargo fmt                # フォーマット
 
 ## アーキテクチャ
 
+### モジュール構成
+
+- [src/app.rs](src/app.rs) — CLI 引数、入力の検証（`plan_jobs`）、4 段のパイプラインの組み立てとエラー報告
+- [src/convert.rs](src/convert.rs) — 展開済みの画像を WebP に変換する（`resize_image_files` / `resize_image_file_webp`）
+- [src/webp_names.rs](src/webp_names.rs) — 変換後の WebP の出力名を衝突しないように決める（`rename_to_final_names`）
+- [src/image_util.rs](src/image_util.rs) — 画像単体の処理（デコード・縮小・WebP エンコード・アニメーション判定）
+- [src/zip_util.rs](src/zip_util.rs) — zip の展開・作成
+- [src/fs_util.rs](src/fs_util.rs) — パスとディレクトリ走査の小さなヘルパー
+- `src/test_util.rs` — 複数モジュールのテストで共有するヘルパー（`#[cfg(test)]`）
+
 ### 4 段のパイプライン（[src/app.rs](src/app.rs)）
 
 `run()` が 4 つのワーカースレッドを立ち上げ、`std::sync::mpsc` チャネルで繋いだパイプラインを構成する。各段は自身の `ProgressBar` を持ち、`MultiProgress` で同時表示される。
@@ -49,7 +59,7 @@ cargo fmt                # フォーマット
 - 各入力の出力先は処理開始前に `plan_jobs` で一度だけ決め、`ZipJob`（入力と出力先の組）としてパイプラインに流す（後段で出力先を求め直さない）。その際、正規化したパスで、出力先が入力ファイルを上書きしないこと（`-d` に入力元と同じディレクトリを指定した場合や、再実行時に前回の `a_resized.zip` が glob に含まれた場合）と、出力先同士が重ならないこと（`-d` 指定時に別ディレクトリの同名 zip を渡した場合は先に指定した方を優先）を検証する。問題のある入力は報告して除き、残りは処理を続ける。同じファイルの重複指定は黙って 1 つにまとめる。なお出力先の予約はサイズチェックより前なので、平均サイズが `MIN_AVERAGE_FILE_SIZE` 以下で実際には出力されない入力も出力先を予約する（保守的な側に倒している）。
 - ユーザーに表示するメッセージは英語で書く（コード内コメントは日本語）。
 
-### 画像変換方針（[src/image_util.rs](src/image_util.rs), `resize_image_file_webp`）
+### 画像変換方針（[src/convert.rs](src/convert.rs), [src/webp_names.rs](src/webp_names.rs), [src/image_util.rs](src/image_util.rs)）
 
 - 変換対象外の判定: 既に WebP かつ 1MB 未満のファイルと、アニメーション画像（アニメーション GIF / APNG / アニメーション WebP。`image_util::is_animated`）はスキップする（戻り値 `None`）。静止画の WebP にすると先頭フレーム以外が失われるため。画像でない（形式を判定できない）ファイルと未対応の形式（`ImageError::Unsupported`）も黙って `None` を返す。形式は判定できたのにデコードできない壊れた画像は、エラーとして扱う。
 - 個々の画像の変換に失敗した場合（読めない・壊れている・エンコードできないなど）は、その画像を元のまま残し、残りの画像の変換を続ける。失敗は `resize_image_files` の戻り値（`ResizeOutcome::failed`）で返し、zip ごとに 1 件のエラーとしてまとめて報告する（ディスクフルなどで大量に失敗しても表示が溢れないよう、個別のファイルは先頭 5 件まで）。zip は、失敗した画像だけ元の形式のまま出力される（終了コードは非ゼロ）。元画像は WebP の書き出しに成功してから削除するので、失敗しても元画像は失われない。
@@ -70,4 +80,4 @@ cargo fmt                # フォーマット
 
 ### 未使用コード
 
-`resize_image_file_jpg`（app.rs）は現状のパイプラインからは呼ばれていない（`#[allow(dead_code)]` 付き）。削除ではなく残されているので、参照する前に本当に必要か確認すること。
+`resize_image_file_jpg`（convert.rs）は現状のパイプラインからは呼ばれていない（`#[allow(dead_code)]` 付き）。削除ではなく残されているので、参照する前に本当に必要か確認すること。

@@ -16,8 +16,29 @@ pub fn scan_regular_files<P: AsRef<Path>>(
         })
 }
 
+/// 親ディレクトリを返す（`a.zip` のような相対パスのファイル名だけの場合は `.`）
+pub fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+/// エラー表示用に、`path` を `base_dir`（展開先の一時ディレクトリ）からの相対パスにする
+///
+/// 一時ディレクトリの絶対パスは報告する時点で消えていて、zip 内のどのファイルかも分からないため。
+pub fn display_in(path: &Path, base_dir: &Path) -> String {
+    match path.strip_prefix(base_dir) {
+        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+        Ok(rel) => rel.display().to_string(),
+        Err(_) => path.display().to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     #[test]
     fn test_scan_regular_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -44,5 +65,28 @@ mod tests {
             return;
         };
         assert!(super::scan_regular_files(dir.path()).any(|r| r.is_err()));
+    }
+
+    #[test]
+    fn test_parent_dir() {
+        assert_eq!(super::parent_dir(Path::new("/d/a.zip")), Path::new("/d"));
+        // ファイル名だけの相対パスはカレントディレクトリ
+        assert_eq!(super::parent_dir(Path::new("a.zip")), Path::new("."));
+    }
+
+    #[test]
+    fn test_display_in() {
+        let base = Path::new("/tmp/.tmpA1b2");
+        // 展開先からの相対パス（zip 内のパス）で表示する
+        assert_eq!(
+            super::display_in(&base.join("chapter1/001.webp"), base),
+            "chapter1/001.webp"
+        );
+        assert_eq!(super::display_in(base, base), ".");
+        // 展開先の外のパスはそのまま
+        assert_eq!(
+            super::display_in(Path::new("/out/a.zip"), base),
+            "/out/a.zip"
+        );
     }
 }

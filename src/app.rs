@@ -1,7 +1,6 @@
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
-    ffi::{OsStr, OsString},
-    io::Write,
+    ffi::OsString,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -13,23 +12,16 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressStyle};
-use rayon::prelude::*;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-use crate::fs_util;
-use crate::image_util::{self, ReduceSize, ToWebPMemory};
+use crate::convert::{resize_image_files, ResizeOutcome};
+use crate::fs_util::{self, display_in, parent_dir};
 use crate::zip_util;
 
 /// 処理対象にする zip の、1 ファイルあたりの平均サイズの下限
 ///
 /// 平均がこれ以下の zip は、既に十分小さいとみなして処理しない。
 const MIN_AVERAGE_FILE_SIZE: u64 = 500 * 1024; // 500KB
-
-/// 変換後の WebP の目標サイズ
-///
-/// エンコード時はこのサイズ以下に収まるまで品質を下げる。また、既にこのサイズ未満の
-/// WebP は変換しない。
-const MAX_WEBP_SIZE: usize = 1024 * 1024; // 1MB
 
 /// 展開済み zip（一時ディレクトリ）を受け渡すチャネル 1 本あたりに溜めておける数
 ///
@@ -84,253 +76,6 @@ struct ZipJob {
 struct ProcessingContext {
     work_dir: tempfile::TempDir,
     job: ZipJob,
-}
-
-#[allow(dead_code)]
-fn resize_image_file_jpg<P: AsRef<Path>>(path: P, max_height: u32) -> image::ImageResult<()> {
-    let Ok(image) = image::open(path.as_ref()) else {
-        return Ok(());
-    };
-
-    println!("resize image: {:?}", path.as_ref());
-    std::fs::remove_file(path.as_ref())?;
-    let resized_image = image.reduce_size(max_height);
-
-    let writer =
-        std::io::BufWriter::new(std::fs::File::create(path.as_ref().with_extension("jpg"))?);
-    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(writer, 95);
-
-    // エンコード（ファイルへの書き込み）
-    enc.encode(
-        resized_image.as_bytes(),
-        resized_image.width(),
-        resized_image.height(),
-        resized_image.color().into(),
-    )
-
-    // resized_image.save(path.as_ref().with_extension("jpg"))
-}
-
-/// `src` を WebP に変換し、同じディレクトリの一時ファイルに書き出す
-///
-/// 書き出しに成功してから `src` を削除し、一時ファイルのパスを返す。
-/// 変換対象外のファイルは `None` を返す。
-/// 最終的なファイル名は、全ファイルの変換後に `rename_to_final_names` で決める。
-fn resize_image_file_webp(src: &Path, max_height: u32) -> Result<Option<PathBuf>> {
-    use image::ImageFormat::*;
-
-    let reader = image::ImageReader::open(src)?.with_guessed_format()?;
-    if reader.format() == Some(WebP) && src.metadata()?.len() < MAX_WEBP_SIZE as u64 {
-        return Ok(None);
-    }
-    // 静止画の WebP にすると先頭フレーム以外が失われるので、そのまま残す
-    if image_util::is_animated(src, reader.format()) {
-        return Ok(None);
-    }
-
-    let image = match image_util::decode_with_orientation(reader) {
-        Ok(image) => image,
-        // 画像でない（形式を判定できない）ファイルや未対応の形式は、変換対象外として黙って残す
-        Err(image::ImageError::Unsupported(_)) => return Ok(None),
-        // 画像と判定できたのにデコードできないのは壊れた画像なので、エラーとして報告する
-        Err(e) => return Err(anyhow::Error::new(e).context("failed to decode")),
-    };
-
-    let webp = image.reduce_size(max_height).to_webp(MAX_WEBP_SIZE)?;
-
-    // 既存のファイルと衝突しない一意な名前で作成する（失敗時は自動で削除される）
-    let mut tmp = tempfile::Builder::new()
-        .suffix(".webp.tmp")
-        .tempfile_in(parent_dir(src))
-        .context("failed to create a temporary file")?;
-    tmp.write_all(webp.as_ref())
-        .context("failed to write the converted image")?;
-    // エラー（PathPersistError）は一時ファイルを保持しているので、io::Error だけを取り出して
-    // 一時ファイルをその場で削除する（失敗の一覧に残ると zip に紛れ込みうる）
-    let tmp = tmp
-        .into_temp_path()
-        .keep()
-        .map_err(|e| e.error)
-        .context("failed to keep the converted image")?;
-
-    // 元画像を消せなかった場合は、変換結果を消して元画像だけを残す
-    // （失敗しても zip の処理を続けるため、変換結果の残骸を zip に紛れ込ませない）
-    if let Err(e) = std::fs::remove_file(src) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(anyhow::Error::new(e).context("failed to remove the original image"));
-    }
-
-    Ok(Some(tmp))
-}
-
-/// 親ディレクトリを返す（`a.zip` のような相対パスのファイル名だけの場合は `.`）
-fn parent_dir(path: &Path) -> &Path {
-    match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    }
-}
-
-/// エラー表示用に、`path` を `base_dir`（展開先の一時ディレクトリ）からの相対パスにする
-///
-/// 一時ディレクトリの絶対パスは報告する時点で消えていて、zip 内のどのファイルかも分からないため。
-fn display_in(path: &Path, base_dir: &Path) -> String {
-    match path.strip_prefix(base_dir) {
-        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
-        Ok(rel) => rel.display().to_string(),
-        Err(_) => path.display().to_string(),
-    }
-}
-
-/// 衝突判定用のキー（大文字小文字を区別しないファイルシステムも考慮する）
-fn name_key(name: &OsStr) -> String {
-    name.to_string_lossy().to_lowercase()
-}
-
-/// 衝突がない場合の変換後のファイル名（`001.png` → `001.webp`）
-fn natural_webp_name(src: &Path) -> OsString {
-    src.with_extension("webp")
-        .file_name()
-        .unwrap()
-        .to_os_string()
-}
-
-/// 衝突する場合の変換後のファイル名の候補を優先順に返す
-///
-/// `001.png` → `001.png.webp`, `001.png.1.webp`, `001.png.2.webp`, …
-fn fallback_webp_names(src: &Path) -> impl Iterator<Item = OsString> {
-    let name = src.file_name().unwrap().to_os_string();
-
-    (0..).map(move |n| {
-        let mut candidate = name.clone();
-        if n > 0 {
-            candidate.push(format!(".{n}"));
-        }
-        candidate.push(".webp");
-        candidate
-    })
-}
-
-/// 一時ファイルに書き出した変換結果を、既存のファイルと衝突しない最終的な名前へ rename する
-///
-/// 単純に拡張子を `.webp` に変えると、`001.jpg` と `001.png` が同じ `001.webp` に
-/// なったり、変換対象外の既存の `001.webp` を上書きしたりして画像が失われる。
-/// 衝突する場合は元の拡張子を残した名前（`001.png.webp`）にする。
-///
-/// 変換されたファイル同士が衝突する場合は、全員を元の拡張子を残した名前にする。
-/// 片方だけを `001.webp` にすると、`001.png.webp` < `001.webp` の順に並んで
-/// ページ順が逆転するため。
-///
-/// 実際に変換されたファイルだけを対象に、ディレクトリ内に実在する名前
-/// （ディレクトリも含む）と照合して決める。パス順に割り当てるので、
-/// 結果は並列処理の実行順に左右されない。
-///
-/// エラーには、一時ディレクトリの絶対パスではなく `base_dir` からの相対パス（zip 内のパス）を示す。
-fn rename_to_final_names(mut converted: Vec<(PathBuf, PathBuf)>, base_dir: &Path) -> Result<()> {
-    converted.sort();
-
-    // 変換後の名前同士の衝突を数える
-    let mut natural_counts: HashMap<(&Path, String), usize> = HashMap::new();
-    for (src, _) in &converted {
-        let key = (parent_dir(src), name_key(&natural_webp_name(src)));
-        *natural_counts.entry(key).or_default() += 1;
-    }
-
-    let pending: HashSet<&Path> = converted.iter().map(|(_, tmp)| tmp.as_path()).collect();
-    // ディレクトリごとの使用済みの名前
-    let mut taken: HashMap<&Path, HashSet<String>> = HashMap::new();
-
-    for (src, tmp) in &converted {
-        let dir = parent_dir(src);
-        let names = match taken.entry(dir) {
-            Entry::Occupied(e) => e.into_mut(),
-            // 未 rename の一時ファイルは使用済みとして扱わない
-            Entry::Vacant(e) => e.insert(existing_names(dir, &pending).with_context(|| {
-                format!("failed to read directory {}", display_in(dir, base_dir))
-            })?),
-        };
-
-        let natural = natural_webp_name(src);
-        let key = (dir, name_key(&natural));
-        let name = if natural_counts[&key] == 1 && !names.contains(&key.1) {
-            natural
-        } else {
-            fallback_webp_names(src)
-                .find(|candidate| !names.contains(&name_key(candidate)))
-                .unwrap()
-        };
-        names.insert(name_key(&name));
-        let dst = dir.join(name);
-        std::fs::rename(tmp, &dst).with_context(|| {
-            format!(
-                "failed to rename the converted image to {}",
-                display_in(&dst, base_dir)
-            )
-        })?;
-    }
-
-    Ok(())
-}
-
-/// `dir` 直下にある名前（ディレクトリも含む）の衝突判定用キーを集める（`exclude` は除く）
-fn existing_names(dir: &Path, exclude: &HashSet<&Path>) -> std::io::Result<HashSet<String>> {
-    let mut names = HashSet::new();
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if !exclude.contains(path.as_path()) {
-            names.insert(name_key(path.file_name().unwrap()));
-        }
-    }
-    Ok(names)
-}
-
-/// `resize_image_files` の結果
-struct ResizeOutcome {
-    /// 変換できた画像の枚数
-    converted: usize,
-    /// 変換に失敗した画像とその理由（パス順）。これらの画像は元のまま残っている
-    failed: Vec<(PathBuf, anyhow::Error)>,
-}
-
-/// `files` を WebP に変換する
-///
-/// 個々の画像の変換に失敗しても、その画像は元のまま残して `failed` に記録し、
-/// 残りの画像の変換を続ける（1 枚のために zip 全体を諦めない）。
-///
-/// `base_dir` は `files` を展開したディレクトリで、エラーに zip 内のパスを示すのに使う。
-fn resize_image_files(
-    files: &[PathBuf],
-    base_dir: &Path,
-    max_height: u32,
-    pb: ProgressBar,
-) -> Result<ResizeOutcome> {
-    pb.set_position(0);
-    pb.set_length(files.len() as u64);
-
-    let results: Vec<_> = files
-        .par_iter()
-        .progress_with(pb)
-        .map(|src| (src, resize_image_file_webp(src, max_height)))
-        .collect();
-
-    let mut converted = Vec::new();
-    let mut failed = Vec::new();
-    for (src, result) in results {
-        match result {
-            Ok(Some(tmp)) => converted.push((src.clone(), tmp)),
-            Ok(None) => {}
-            Err(e) => failed.push((src.clone(), e)),
-        }
-    }
-    failed.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-    let outcome = ResizeOutcome {
-        converted: converted.len(),
-        failed,
-    };
-    rename_to_final_names(converted, base_dir)?;
-
-    Ok(outcome)
 }
 
 /// 変換に失敗した画像を、zip ごとに 1 件のエラーとしてまとめた文面にする
@@ -771,6 +516,8 @@ pub fn run() -> Result<()> {
 mod tests {
     use std::path::{Path, PathBuf};
 
+    use crate::test_util::list_names;
+
     #[test]
     fn test_append_suffix_to_filename() {
         // サフィックスはそのまま付与される（区切り文字は呼び出し側が含める）
@@ -794,22 +541,6 @@ mod tests {
     }
 
     #[test]
-    fn test_display_in() {
-        let base = Path::new("/tmp/.tmpA1b2");
-        // 展開先からの相対パス（zip 内のパス）で表示する
-        assert_eq!(
-            super::display_in(&base.join("chapter1/001.webp"), base),
-            "chapter1/001.webp"
-        );
-        assert_eq!(super::display_in(base, base), ".");
-        // 展開先の外のパスはそのまま
-        assert_eq!(
-            super::display_in(Path::new("/out/a.zip"), base),
-            "/out/a.zip"
-        );
-    }
-
-    #[test]
     fn test_determine_output_path() {
         let src = Path::new("/path1/path2/test.zip");
 
@@ -820,124 +551,6 @@ mod tests {
         // 未指定時は元ファイル名に _resized を付ける
         let path = super::determine_output_path(src, None);
         assert_eq!(path, Path::new("/path1/path2/test_resized.zip"));
-    }
-
-    #[test]
-    fn test_fallback_webp_names() {
-        let candidates: Vec<_> = super::fallback_webp_names(Path::new("/d/001.png"))
-            .take(3)
-            .collect();
-        assert_eq!(
-            candidates,
-            ["001.png.webp", "001.png.1.webp", "001.png.2.webp"]
-        );
-    }
-
-    /// ディレクトリ直下のエントリ名をソートして返す
-    fn list_names(dir: &Path) -> Vec<String> {
-        let mut names: Vec<_> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-        names.sort();
-        names
-    }
-
-    /// `files` を作成して変換し、変換件数と変換後のエントリ名を返す
-    ///
-    /// 末尾が `/` ならディレクトリ、`.db` なら画像でないファイル、`anim` で始まれば
-    /// アニメーション GIF、それ以外は静止画として作成する
-    fn resize_files_in_tempdir(files: &[&str]) -> (usize, Vec<String>) {
-        let dir = tempfile::tempdir().unwrap();
-        for file in files {
-            let path = dir.path().join(file);
-            if file.ends_with('/') {
-                std::fs::create_dir(&path).unwrap();
-            } else if file.ends_with(".db") {
-                std::fs::write(&path, b"not an image").unwrap();
-            } else if file.starts_with("anim") {
-                crate::test_util::write_animated_gif(&path);
-            } else {
-                crate::test_util::write_image(&path);
-            }
-        }
-
-        let outcome = resize_dir(dir.path());
-        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
-        (outcome.converted, list_names(dir.path()))
-    }
-
-    #[test]
-    fn test_resize_image_files_keeps_same_stem_images() {
-        // 両方の画像が別名の WebP として残り、ページ順も保たれること
-        let (resized, names) = resize_files_in_tempdir(&["001.jpg", "001.png"]);
-        assert_eq!(resized, 2);
-        assert_eq!(names, ["001.jpg.webp", "001.png.webp"]);
-    }
-
-    #[test]
-    fn test_resize_image_files_does_not_overwrite_skipped_webp() {
-        // 変換対象外の既存 WebP は上書きしない（大文字小文字違いも衝突とみなす）
-        let (resized, names) =
-            resize_files_in_tempdir(&["001.webp", "001.png", "002.WEBP", "002.png"]);
-        assert_eq!(resized, 2);
-        assert_eq!(
-            names,
-            ["001.png.webp", "001.webp", "002.WEBP", "002.png.webp"]
-        );
-    }
-
-    #[test]
-    fn test_resize_image_files_keeps_animated_gif() {
-        // アニメーション GIF は変換せずにそのまま残し、静止画の GIF は変換する
-        let (resized, names) = resize_files_in_tempdir(&["anim.gif", "still.gif"]);
-        assert_eq!(resized, 1);
-        assert_eq!(names, ["anim.gif", "still.webp"]);
-    }
-
-    /// `dir` 内の全ファイルを変換する
-    fn resize_dir(dir: &Path) -> super::ResizeOutcome {
-        let files: Vec<PathBuf> = crate::fs_util::scan_regular_files(dir)
-            .collect::<std::io::Result<_>>()
-            .unwrap();
-        super::resize_image_files(&files, dir, 1800, indicatif::ProgressBar::hidden()).unwrap()
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn test_resize_image_files_continues_on_error() {
-        // 読めない画像があっても、その画像は元のまま残して他の画像の変換を続ける
-        let dir = tempfile::tempdir().unwrap();
-        crate::test_util::write_image(&dir.path().join("001.png"));
-        crate::test_util::write_image(&dir.path().join("002.png"));
-        let Some(_restore) = crate::test_util::make_unreadable(&dir.path().join("002.png")) else {
-            return;
-        };
-
-        let outcome = resize_dir(dir.path());
-        assert_eq!(outcome.converted, 1);
-        let failed: Vec<_> = outcome.failed.iter().map(|(file, _)| file).collect();
-        assert_eq!(failed, [&dir.path().join("002.png")]);
-        assert_eq!(list_names(dir.path()), ["001.webp", "002.png"]);
-    }
-
-    #[test]
-    fn test_resize_image_files_reports_corrupt_image() {
-        // 画像と判定できるのにデコードできない（壊れた）画像は報告し、画像でないファイルは黙って残す
-        let dir = tempfile::tempdir().unwrap();
-        crate::test_util::write_image(&dir.path().join("001.png"));
-        let png = std::fs::read(dir.path().join("001.png")).unwrap();
-        std::fs::write(dir.path().join("002.png"), &png[..png.len() / 2]).unwrap();
-        std::fs::write(dir.path().join("readme.txt"), b"not an image").unwrap();
-
-        let outcome = resize_dir(dir.path());
-        assert_eq!(outcome.converted, 1);
-        let failed: Vec<_> = outcome.failed.iter().map(|(file, _)| file).collect();
-        assert_eq!(failed, [&dir.path().join("002.png")]);
-        assert_eq!(
-            list_names(dir.path()),
-            ["001.webp", "002.png", "readme.txt"]
-        );
     }
 
     #[test]
@@ -961,62 +574,6 @@ mod tests {
              001.png: broken\n  002.png: broken\n  003.png: broken\n  004.png: broken\n  \
              005.png: broken\n  ... and 2 more"
         );
-    }
-
-    #[test]
-    fn test_resize_image_files_ignores_non_image_names() {
-        // 画像でないファイルは変換されないので、名前の割り当てにも影響しない
-        let (resized, names) = resize_files_in_tempdir(&["001.db", "001.jpg"]);
-        assert_eq!(resized, 1);
-        assert_eq!(names, ["001.db", "001.webp"]);
-    }
-
-    #[test]
-    fn test_resize_image_files_avoids_directory_name() {
-        // 同名のディレクトリ（001.webp/）とも衝突させない
-        let (resized, names) = resize_files_in_tempdir(&["001.webp/", "001.png"]);
-        assert_eq!(resized, 1);
-        assert_eq!(names, ["001.png.webp", "001.webp"]);
-    }
-
-    #[test]
-    fn test_rename_to_final_names_numbering() {
-        // 元の拡張子を残した名前まで使用済みなら連番を付ける
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("001.png.webp"), b"existing").unwrap();
-        let tmp_jpg = dir.path().join("a.webp.tmp");
-        let tmp_png = dir.path().join("b.webp.tmp");
-        std::fs::write(&tmp_jpg, b"jpg").unwrap();
-        std::fs::write(&tmp_png, b"png").unwrap();
-
-        super::rename_to_final_names(
-            vec![
-                (dir.path().join("001.png"), tmp_png),
-                (dir.path().join("001.jpg"), tmp_jpg),
-            ],
-            dir.path(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            list_names(dir.path()),
-            ["001.jpg.webp", "001.png.1.webp", "001.png.webp"]
-        );
-        assert_eq!(
-            std::fs::read(dir.path().join("001.png.1.webp")).unwrap(),
-            b"png"
-        );
-        assert_eq!(
-            std::fs::read(dir.path().join("001.png.webp")).unwrap(),
-            b"existing"
-        );
-    }
-
-    #[test]
-    fn test_parent_dir() {
-        assert_eq!(super::parent_dir(Path::new("/d/a.zip")), Path::new("/d"));
-        // ファイル名だけの相対パスはカレントディレクトリ
-        assert_eq!(super::parent_dir(Path::new("a.zip")), Path::new("."));
     }
 
     /// `files` を空ファイルとして作成し、そのパスを返す
