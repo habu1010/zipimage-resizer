@@ -34,9 +34,9 @@ struct Args {
     #[clap(short = 'd', long)]
     output_dir: Option<PathBuf>,
 
-    /// 最小の高さ
+    /// 画像の高さの上限（これより高い画像は、縦横比を保ってこの高さまで縮小する）
     #[clap(long, default_value = "1800")]
-    min_height: u32,
+    max_height: u32,
 
     /// 最終更新日時を保持する
     #[clap(short, long)]
@@ -60,14 +60,14 @@ struct ProcessingContext {
 }
 
 #[allow(dead_code)]
-fn resize_image_file_jpg<P: AsRef<Path>>(path: P, min_height: u32) -> image::ImageResult<()> {
+fn resize_image_file_jpg<P: AsRef<Path>>(path: P, max_height: u32) -> image::ImageResult<()> {
     let Ok(image) = image::open(path.as_ref()) else {
         return Ok(());
     };
 
     println!("resize image: {:?}", path.as_ref());
     std::fs::remove_file(path.as_ref())?;
-    let resized_image = image.reduce_size(min_height);
+    let resized_image = image.reduce_size(max_height);
 
     let writer =
         std::io::BufWriter::new(std::fs::File::create(path.as_ref().with_extension("jpg"))?);
@@ -89,7 +89,7 @@ fn resize_image_file_jpg<P: AsRef<Path>>(path: P, min_height: u32) -> image::Ima
 /// 書き出しに成功してから `src` を削除し、一時ファイルのパスを返す。
 /// 変換対象外のファイルは `None` を返す。
 /// 最終的なファイル名は、全ファイルの変換後に `rename_to_final_names` で決める。
-fn resize_image_file_webp(src: &Path, min_height: u32) -> Result<Option<PathBuf>> {
+fn resize_image_file_webp(src: &Path, max_height: u32) -> Result<Option<PathBuf>> {
     use image::ImageFormat::*;
 
     const MAX_WEBP_SIZE: usize = 1024 * 1024; // 1MB
@@ -111,7 +111,7 @@ fn resize_image_file_webp(src: &Path, min_height: u32) -> Result<Option<PathBuf>
         Err(e) => return Err(anyhow::Error::new(e).context("failed to decode")),
     };
 
-    let webp = image.reduce_size(min_height).to_webp(MAX_WEBP_SIZE)?;
+    let webp = image.reduce_size(max_height).to_webp(MAX_WEBP_SIZE)?;
 
     // 既存のファイルと衝突しない一意な名前で作成する（失敗時は自動で削除される）
     let mut tmp = tempfile::Builder::new()
@@ -244,7 +244,7 @@ struct ResizeOutcome {
 /// 残りの画像の変換を続ける（1 枚のために zip 全体を諦めない）。
 fn resize_image_files(
     files: &[PathBuf],
-    min_height: u32,
+    max_height: u32,
     pb: ProgressBar,
 ) -> Result<ResizeOutcome> {
     pb.set_position(0);
@@ -253,7 +253,7 @@ fn resize_image_files(
     let results: Vec<_> = files
         .par_iter()
         .progress_with(pb)
-        .map(|src| (src, resize_image_file_webp(src, min_height)))
+        .map(|src| (src, resize_image_file_webp(src, max_height)))
         .collect();
 
     let mut converted = Vec::new();
@@ -537,7 +537,7 @@ fn spawn_zip_extraction_thread(
 }
 
 fn spawn_image_resizing_thread(
-    min_height: u32,
+    max_height: u32,
     zip_extraction_rx: Receiver<ProcessingContext>,
     reporter: &Reporter,
 ) -> (JoinHandle<Result<()>>, Receiver<ProcessingContext>) {
@@ -563,7 +563,7 @@ fn spawn_image_resizing_thread(
                     continue;
                 }
             };
-            match resize_image_files(&files, min_height, pb.clone()) {
+            match resize_image_files(&files, max_height, pb.clone()) {
                 Ok(outcome) => {
                     if !outcome.failed.is_empty() {
                         reporter.report_error(format_conversion_failures(&ctx, &outcome));
@@ -655,7 +655,7 @@ fn spawn_zip_creation_thread(
 pub fn run() -> Result<()> {
     let Args {
         output_dir,
-        min_height,
+        max_height,
         keep_mtime,
         zipfiles,
     } = Args::parse();
@@ -678,7 +678,7 @@ pub fn run() -> Result<()> {
     let (zip_extraction_handle, zip_extraction_rx) =
         spawn_zip_extraction_thread(size_check_rx, &reporter);
     let (image_resizing_handle, image_resizing_rx) =
-        spawn_image_resizing_thread(min_height, zip_extraction_rx, &reporter);
+        spawn_image_resizing_thread(max_height, zip_extraction_rx, &reporter);
     let zip_creation_handle = spawn_zip_creation_thread(keep_mtime, image_resizing_rx, &reporter);
 
     // 途中で return すると残りのスレッドが強制終了され、

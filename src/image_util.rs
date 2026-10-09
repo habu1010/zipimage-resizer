@@ -7,15 +7,16 @@ use image::metadata::Orientation;
 use image::{GenericImageView, ImageDecoder};
 
 pub trait ReduceSize {
-    fn reduce_size(self, height: u32) -> Self;
+    /// 高さが `max_height` を超える画像を、縦横比を保って `max_height` まで縮小する（拡大はしない）
+    fn reduce_size(self, max_height: u32) -> Self;
 }
 
 impl ReduceSize for image::DynamicImage {
-    fn reduce_size(self, height: u32) -> Self {
+    fn reduce_size(self, max_height: u32) -> Self {
         use image::imageops::FilterType::*;
-        // 高さがちょうど閾値と同じ画像は、同じサイズへの無駄なリサンプリングになるので除く
+        // 高さがちょうど上限と同じ画像は、同じサイズへの無駄なリサンプリングになるので除く
         match self.dimensions() {
-            (_, h) if h > height => self.resize(u32::MAX, height, Lanczos3),
+            (_, h) if h > max_height => self.resize(u32::MAX, max_height, Lanczos3),
             _ => self,
         }
     }
@@ -114,10 +115,10 @@ mod tests {
     fn test_reduce_size() {
         use super::ReduceSize;
 
-        // 閾値より高い画像だけを、縦横比を保って縮小する
+        // 上限より高い画像だけを、縦横比を保って縮小する
         let image = DynamicImage::new_rgb8(200, 400).reduce_size(100);
         assert_eq!(image.dimensions(), (50, 100));
-        // 閾値以下の画像はそのまま
+        // 上限以下の画像はそのまま
         let image = DynamicImage::new_rgb8(200, 100).reduce_size(100);
         assert_eq!(image.dimensions(), (200, 100));
     }

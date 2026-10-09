@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 zip でまとめられた画像（電子書籍・漫画アーカイブを想定）を、画像を WebP に再エンコード・縮小することで軽量化し、新しい zip として出力する CLI ツール。
 
 ```
-zipimage-resizer [-d 出力先ディレクトリ] [--min-height 1800] [-k|--keep-mtime] <zipfile>...
+zipimage-resizer [-d 出力先ディレクトリ] [--max-height 1800] [-k|--keep-mtime] <zipfile>...
 ```
 
 - `-d/--output_dir` 未指定時は、元ファイル名に `_resized` サフィックスを付けたパスへ出力する（`determine_output_path`）。
@@ -54,7 +54,7 @@ cargo fmt                # フォーマット
 - 変換対象外の判定: 既に WebP かつ 1MB 未満のファイルと、アニメーション画像（アニメーション GIF / APNG / アニメーション WebP。`image_util::is_animated`）はスキップする（戻り値 `None`）。静止画の WebP にすると先頭フレーム以外が失われるため。画像でない（形式を判定できない）ファイルと未対応の形式（`ImageError::Unsupported`）も黙って `None` を返す。形式は判定できたのにデコードできない壊れた画像は、エラーとして扱う。
 - 個々の画像の変換に失敗した場合（読めない・壊れている・エンコードできないなど）は、その画像を元のまま残し、残りの画像の変換を続ける。失敗は `resize_image_files` の戻り値（`ResizeOutcome::failed`）で返し、zip ごとに 1 件のエラーとしてまとめて報告する（ディスクフルなどで大量に失敗しても表示が溢れないよう、個別のファイルは先頭 5 件まで）。zip は、失敗した画像だけ元の形式のまま出力される（終了コードは非ゼロ）。元画像は WebP の書き出しに成功してから削除するので、失敗しても元画像は失われない。
 - デコードは `image_util::decode_with_orientation` で行い、EXIF の向き（Orientation）を画素に反映する（WebP には元の EXIF を引き継がないため）。
-- `ReduceSize::reduce_size` は高さが閾値を超えるときだけ Lanczos3 で縮小する（拡大はしない。ちょうど閾値と同じ高さの画像もそのまま）。
+- `ReduceSize::reduce_size` は高さが上限（`--max-height`）を超えるときだけ Lanczos3 で縮小する（拡大はしない。ちょうど上限と同じ高さの画像もそのまま）。
 - `ToWebPMemory::to_webp` は品質 95 → 85 → … → 15 と下げながらエンコードし、**1MB 以下に収まった最初の結果**を採用する。全滅時は品質 10 で確定。
 - WebP エンコーダは RGB8 / RGBA8 しか受け付けないため、それ以外は透過情報があれば RGBA8、なければ RGB8 に変換してからエンコードする。
 - 元ファイルは削除し、拡張子を `.webp` に変えて書き出す（zip 内のファイル名が変わる点に注意）。
