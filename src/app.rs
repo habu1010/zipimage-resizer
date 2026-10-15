@@ -1,5 +1,4 @@
 use std::{
-    ffi::OsString,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread::JoinHandle,
@@ -11,7 +10,7 @@ use indicatif::ProgressBar;
 
 use crate::archive::ArchiveFormat;
 use crate::convert::{resize_image_files, ResizeOutcome};
-use crate::fs_util::parent_dir;
+use crate::fs_util;
 use crate::plan::{plan_jobs, ArchiveJob};
 use crate::reporter::Reporter;
 use crate::zip_util;
@@ -222,28 +221,10 @@ fn spawn_image_resizing_thread(
 ///
 /// 出力先と同じディレクトリの一時ファイルに zip を書き出し、完成してから rename で置き換える。
 /// 途中で失敗・中断しても、出力先に書きかけの zip が現れたり、既存のファイルが壊れたりしない。
-/// 失敗時の一時ファイルは drop 時に自動で削除される。ただし Ctrl-C などで強制終了した場合は
-/// drop されずに残るため、何の残骸か分かるよう出力先の名前を含めておく
-/// （`a_resized.zip` → `.a_resized.zip.XXXXXX.tmp`）。
+/// 失敗時の一時ファイルは drop 時に自動で削除される（`fs_util::temp_file_beside` 参照）。
 fn create_resized_zip(ctx: &ProcessingContext, keep_mtime: bool, pb: &ProgressBar) -> Result<()> {
     let dst_file = &ctx.job.dst_file;
-    let mut prefix = OsString::from(".");
-    prefix.push(dst_file.file_name().unwrap_or_default());
-    prefix.push(".");
-
-    let mut builder = tempfile::Builder::new();
-    builder.prefix(&prefix).suffix(".tmp");
-    // 一時ファイルは既定で所有者のみ読み書き可（0600）になるため、
-    // 通常のファイル作成と同じく umask に従ったパーミッションにする
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        builder.permissions(std::fs::Permissions::from_mode(0o666));
-    }
-    let dst_dir = parent_dir(dst_file);
-    let dst_tempfile = builder
-        .tempfile_in(dst_dir)
-        .with_context(|| format!("failed to create a temporary file in {}", dst_dir.display()))?;
+    let dst_tempfile = fs_util::temp_file_beside(dst_file)?;
 
     zip_util::zip_with_progress(ctx.work_dir.path(), dst_tempfile.as_file(), pb)
         .context("failed to write the zip")?;
@@ -399,10 +380,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn test_create_resized_zip() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let src = touch_files(dir.path(), &["a.zip"]).remove(0);
         let old_mtime =
@@ -423,16 +401,8 @@ mod tests {
         assert_eq!(archive.file_names().collect::<Vec<_>>(), ["001.webp"]);
         assert_eq!(dst.metadata().unwrap().modified().unwrap(), old_mtime);
 
-        // パーミッションは通常のファイル作成と同じ（一時ファイルの 0600 のままにならない）
-        let reference = touch_files(dir.path(), &["reference"]).remove(0);
-        let mode = |path: &Path| path.metadata().unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&dst), mode(&reference));
-
         // 一時ファイルが残っていない
-        assert_eq!(
-            list_names(dir.path()),
-            ["a.zip", "a_resized.zip", "reference"]
-        );
+        assert_eq!(list_names(dir.path()), ["a.zip", "a_resized.zip"]);
     }
 
     #[test]

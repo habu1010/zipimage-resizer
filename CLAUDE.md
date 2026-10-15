@@ -38,7 +38,7 @@ cargo fmt                # フォーマット
 - [src/archive.rs](src/archive.rs) — 入力の形式（zip / RAR）の判定（`ArchiveFormat::detect`）と、形式ごとの件数取得・展開への振り分け
 - [src/zip_util.rs](src/zip_util.rs) — zip の展開・作成
 - [src/rar_util.rs](src/rar_util.rs) — RAR のシグネチャによる判定（`is_rar`）と展開
-- [src/fs_util.rs](src/fs_util.rs) — パスとディレクトリ走査の小さなヘルパー
+- [src/fs_util.rs](src/fs_util.rs) — パス・ディレクトリ走査・一時ファイルの小さなヘルパー
 - `src/test_util.rs` — 複数モジュールのテストで共有するヘルパー（`#[cfg(test)]`）
 
 ### 4 段のパイプライン（[src/app.rs](src/app.rs)）
@@ -48,7 +48,7 @@ cargo fmt                # フォーマット
 1. `spawn_size_check_thread` — 入力アーカイブのファイルサイズ ÷ 内包ファイル数で 1 ファイル平均サイズを求め、**500KB（`MIN_AVERAGE_FILE_SIZE`）超のものだけ**を下流に流す（既に十分小さいアーカイブは処理しない）。
 2. `spawn_extraction_thread` — `tempfile::TempDir` に展開する（zip / RAR は `ArchiveJob::format` で振り分け）。
 3. `spawn_image_resizing_thread` — 展開ファイルを rayon で並列にリサイズ。**1 枚も変換されなかったアーカイブは下流に送らない**（＝出力ファイルを作らない）。
-4. `spawn_zip_creation_thread` — 出力先と同じディレクトリの一時ファイル（`*.zip.tmp`）に zip を書き、完了後に rename（`persist`）で出力先へ置き換える（途中で失敗・中断しても、書きかけの zip が出力先に現れず、既存のファイルも壊さないため）。置き換え前に `sync_all` する（電源断時に既存の出力が空ファイルに置き換わるのを防ぐ）。一時ファイルは既定で 0600 になるので、umask に従うパーミッションを明示している。失敗時の一時ファイルは drop で消えるが、Ctrl-C などの強制終了時は `.a_resized.zip.XXXXXX.tmp` が残る（展開用の一時ディレクトリが /tmp に残るのと同様、許容している）。
+4. `spawn_zip_creation_thread` — 出力先と同じディレクトリの一時ファイル（`*.zip.tmp`、`fs_util::temp_file_beside`）に zip を書き、完了後に rename（`persist`）で出力先へ置き換える（途中で失敗・中断しても、書きかけの zip が出力先に現れず、既存のファイルも壊さないため）。置き換え前に `sync_all` する（電源断時に既存の出力が空ファイルに置き換わるのを防ぐ）。一時ファイルは既定で 0600 になるので、umask に従うパーミッションを明示している。失敗時の一時ファイルは drop で消えるが、Ctrl-C などの強制終了時は `.a_resized.zip.XXXXXX.tmp` が残る（展開用の一時ディレクトリが /tmp に残るのと同様、許容している）。
 
 展開済みの一時ディレクトリを受け渡すチャネル（展開 → リサイズを作る `spawn_extraction_thread`、リサイズ → zip 作成を作る `spawn_image_resizing_thread`）は、どちらも `sync_channel(MAX_PENDING_WORK_DIRS)` でバックプレッシャーをかけ、一時ディレクトリが際限なく溜まるのを防いでいる。上限はチャネルごとで、同時に存在しうる一時ディレクトリの数は定数のドキュメントコメントを参照。
 

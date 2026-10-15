@@ -1,4 +1,7 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+
+use anyhow::Context;
 
 /// `dir` 以下の通常ファイルを再帰的に列挙する
 ///
@@ -30,6 +33,34 @@ pub fn walk_error_in(e: walkdir::Error, base_dir: &Path) -> anyhow::Error {
     }
 }
 
+/// `dst` を置き換えるための一時ファイルを、`dst` と同じディレクトリに作る
+///
+/// 書き終えてから `persist` で `dst` に rename すれば、途中で失敗・中断しても `dst` に
+/// 書きかけのファイルが現れない（同じディレクトリなので rename で置き換えられる）。
+/// 電源断で rename だけが反映され、既存の `dst` が空や壊れたファイルに置き換わらないよう、
+/// `persist` の前に `sync_all` すること。
+/// 一時ファイルは drop 時に自動で削除されるが、Ctrl-C などで強制終了した場合は残るため、
+/// 何の残骸か分かるよう `dst` の名前を含めておく（`a_resized.zip` → `.a_resized.zip.XXXXXX.tmp`）。
+pub fn temp_file_beside(dst: &Path) -> anyhow::Result<tempfile::NamedTempFile> {
+    let mut prefix = OsString::from(".");
+    prefix.push(dst.file_name().unwrap_or_default());
+    prefix.push(".");
+
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix).suffix(".tmp");
+    // 一時ファイルは既定で所有者のみ読み書き可（0600）になるため、
+    // 通常のファイル作成と同じく umask に従ったパーミッションにする
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let dir = parent_dir(dst);
+    builder
+        .tempfile_in(dir)
+        .with_context(|| format!("failed to create a temporary file in {}", dir.display()))
+}
+
 /// 親ディレクトリを返す（`a.zip` のような相対パスのファイル名だけの場合は `.`）
 pub fn parent_dir(path: &Path) -> &Path {
     match path.parent() {
@@ -53,6 +84,31 @@ pub fn display_in(path: &Path, base_dir: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+
+    #[test]
+    fn test_temp_file_beside() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("a_resized.zip");
+        let tmp = super::temp_file_beside(&dst).unwrap();
+
+        // 出力先と同じディレクトリに、何の残骸か分かる名前で作る
+        assert_eq!(tmp.path().parent(), Some(dir.path()));
+        let name = tmp.path().file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with(".a_resized.zip.") && name.ends_with(".tmp"),
+            "{name}"
+        );
+
+        // パーミッションは通常のファイル作成と同じ（一時ファイルの 0600 のままにならない）。
+        // umask が 077 の環境では両方 0600 になるので、この確認は意味を持たない
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let reference = crate::test_util::touch_files(dir.path(), &["reference"]).remove(0);
+            let mode = |path: &Path| path.metadata().unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(tmp.path()), mode(&reference));
+        }
+    }
 
     #[test]
     fn test_scan_regular_files() {
