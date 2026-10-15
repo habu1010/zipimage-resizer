@@ -14,16 +14,17 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
+use crate::archive::{self, ArchiveFormat};
 use crate::convert::{resize_image_files, ResizeOutcome};
 use crate::fs_util::{self, parent_dir};
 use crate::zip_util;
 
-/// 処理対象にする zip の、1 ファイルあたりの平均サイズの下限
+/// 処理対象にするアーカイブの、1 ファイルあたりの平均サイズの下限
 ///
-/// 平均がこれ以下の zip は、既に十分小さいとみなして処理しない。
+/// 平均がこれ以下のアーカイブは、既に十分小さいとみなして処理しない。
 const MIN_AVERAGE_FILE_SIZE: u64 = 500 * 1024; // 500KB
 
-/// 展開済み zip（一時ディレクトリ）を受け渡すチャネル 1 本あたりに溜めておける数
+/// 展開済みのアーカイブ（一時ディレクトリ）を受け渡すチャネル 1 本あたりに溜めておける数
 ///
 /// 上限がないと、下流の段が遅いときに展開済みの一時ディレクトリが際限なく溜まり、
 /// ディスクを圧迫する。上限はチャネルごとなので、同時に存在する一時ディレクトリは
@@ -34,13 +35,20 @@ const MAX_PENDING_WORK_DIRS: usize = 3;
 // 各引数の説明は --help にそのまま表示されるユーザー向けの文言なので、英語で書き、
 // 説明を二重に持たないよう日本語の doc コメントは付けない。
 #[derive(Parser, Debug)]
-#[clap(about = "Shrink the images in zip archives by re-encoding them to WebP")]
+#[clap(
+    about = "Shrink the images in zip/RAR archives by re-encoding them to WebP \
+                (the output is always a zip)"
+)]
 struct Args {
     #[clap(
         short = 'd',
         long,
         help = "Output directory. If omitted, each output is written next to its input \
-                with \"_resized\" added before the extension (e.g. a.zip -> a_resized.zip)"
+                with \"_resized\" added before the extension (e.g. a.zip -> a_resized.zip). \
+                Outputs are always zip, so RAR archives and .rar/.cbr files are written \
+                with a .zip extension (e.g. a.rar -> a_resized.zip, Vol.1 -> Vol_resized.1.zip). \
+                If this is an input's directory, an input whose output would replace \
+                another existing file there (e.g. a.zip for a.rar) is skipped"
     )]
     output_dir: Option<PathBuf>,
 
@@ -60,28 +68,29 @@ struct Args {
     )]
     keep_mtime: bool,
 
-    #[clap(help = "Zip files to process")]
-    zipfiles: Vec<PathBuf>,
+    #[clap(help = "Zip or RAR files to process")]
+    archives: Vec<PathBuf>,
 }
 
-/// 処理する zip とその出力先の組
+/// 処理するアーカイブ（zip / RAR）とその出力先（zip）の組
 ///
-/// 出力先は `plan_jobs` で検証済みのものを一度だけ決め、後段はそれをそのまま使う。
+/// 形式と出力先は `plan_jobs` で検証済みのものを一度だけ決め、後段はそれをそのまま使う。
 #[derive(Debug, PartialEq)]
-struct ZipJob {
+struct ArchiveJob {
     src_file: PathBuf,
+    format: ArchiveFormat,
     dst_file: PathBuf,
 }
 
 struct ProcessingContext {
     work_dir: tempfile::TempDir,
-    job: ZipJob,
+    job: ArchiveJob,
 }
 
-/// 変換に失敗した画像を、zip ごとに 1 件のエラーとしてまとめた文面にする
+/// 変換に失敗した画像を、アーカイブごとに 1 件のエラーとしてまとめた文面にする
 ///
 /// ディスクフルなどで大量に失敗しても表示が溢れないよう、個別のファイルは先頭の数件だけ示す。
-/// パスは `ResizeOutcome::failed` の zip 内のパスをそのまま示す。
+/// パスは `ResizeOutcome::failed` のアーカイブ内のパスをそのまま示す。
 fn format_conversion_failures(ctx: &ProcessingContext, outcome: &ResizeOutcome) -> String {
     use std::fmt::Write as _;
 
@@ -116,11 +125,47 @@ fn append_suffix_to_filename<P: AsRef<Path>>(path: P, suffix: &str) -> PathBuf {
     path.with_file_name(stem).with_extension(ext)
 }
 
-fn determine_output_path(path: &Path, output_dir: Option<&Path>) -> PathBuf {
-    match output_dir {
+/// 出力先のパスを決める
+///
+/// 出力は常に zip なので、RAR 用の拡張子（`.rar` / `.cbr`）は中身によらず `.zip` にする。
+/// zip 用の拡張子（`.zip` / `.cbz`）は、中身が zip ならそのまま残し、RAR なら `.zip` にする。
+/// RAR の入力のそれ以外の拡張子（`Vol.1` の `.1` など）は名前の一部かもしれないので、
+/// 残して `.zip` を足す（zip の入力は従来どおりそのまま）。
+fn determine_output_path(path: &Path, format: ArchiveFormat, output_dir: Option<&Path>) -> PathBuf {
+    let dst = match output_dir {
         Some(output_dir) => output_dir.join(path.file_name().unwrap()),
         None => append_suffix_to_filename(path, "_resized"),
+    };
+    let has_extension = |exts: &[&str]| {
+        dst.extension()
+            .is_some_and(|ext| exts.iter().any(|e| ext.eq_ignore_ascii_case(e)))
+    };
+    let is_rar = format == ArchiveFormat::Rar;
+    if has_extension(&["rar", "cbr"]) || (is_rar && has_extension(&["zip", "cbz"])) {
+        dst.with_extension("zip")
+    } else if is_rar {
+        let mut dst = dst.into_os_string();
+        dst.push(".zip");
+        dst.into()
+    } else {
+        dst
     }
+}
+
+/// `-d` に入力元と同じディレクトリを指定したときに、拡張子を変えた出力先（`a.rar` → `a.zip`）が
+/// 既に存在するかどうか
+///
+/// 入力や既存の出力がシンボリックリンクの場合も考え、リンク自体の置き場所で比べる
+/// （入力はリンク先のディレクトリも入力元とみなす）。
+fn output_exists_in_input_dir(src: &Path, canonical_src: &Path, dst: &Path) -> bool {
+    let Ok(dst_dir) = parent_dir(dst).canonicalize() else {
+        return false;
+    };
+    let in_input_dir = Some(dst_dir.as_path()) == canonical_src.parent()
+        || parent_dir(src)
+            .canonicalize()
+            .is_ok_and(|src_dir| src_dir == dst_dir);
+    in_input_dir && dst.symlink_metadata().is_ok()
 }
 
 /// 同じファイルかどうかを比較できるよう、パスを正規化する
@@ -133,10 +178,10 @@ fn normalize_path(path: &Path) -> std::io::Result<PathBuf> {
     })
 }
 
-fn calc_average_size_per_file<P: AsRef<Path>>(path: P) -> Result<u64> {
-    let file_size = path.as_ref().metadata()?.len();
-    let file_count = zip_util::get_file_count(path)? as u64;
-    // 空の zip は処理対象外とする（ゼロ除算の回避）
+fn calc_average_size_per_file(path: &Path, format: ArchiveFormat) -> Result<u64> {
+    let file_size = path.metadata()?.len();
+    let file_count = archive::get_file_count(path, format)? as u64;
+    // 空のアーカイブは処理対象外とする（ゼロ除算の回避）
     if file_count == 0 {
         return Ok(0);
     }
@@ -205,16 +250,18 @@ impl Reporter {
 /// - 出力先が入力ファイル（自身でも他の入力でも）と重なる入力は処理しない
 /// - 出力先が重なる場合は、先に指定された入力だけを処理する
 /// - 同じファイルが重複して指定された場合は、1 つにまとめる
+/// - `-d` に入力元と同じディレクトリを指定し、拡張子を変えた出力先（`a.rar` → `a.zip`）が
+///   既に存在する場合は処理しない（入力に含まれていなくても、同じ本の zip 版の原本かもしれないため）
 ///
 /// 処理しない入力は `Reporter` で報告し、残りの処理は続ける。
 fn plan_jobs(
-    zipfiles: Vec<PathBuf>,
+    archives: Vec<PathBuf>,
     output_dir: Option<&Path>,
     reporter: &Reporter,
-) -> Vec<ZipJob> {
+) -> Vec<ArchiveJob> {
     let mut inputs = Vec::new();
     let mut input_paths = HashSet::new();
-    for src in zipfiles {
+    for src in archives {
         let canonical = match src.canonicalize() {
             Ok(canonical) => canonical,
             Err(e) => {
@@ -226,15 +273,19 @@ fn plan_jobs(
             reporter.report_error(format!("Skipping {}: not a file", src.display()));
             continue;
         }
-        if input_paths.insert(canonical) {
-            inputs.push(src);
+        if !input_paths.insert(canonical.clone()) {
+            continue;
+        }
+        match ArchiveFormat::detect(&canonical) {
+            Ok(format) => inputs.push((src, canonical, format)),
+            Err(e) => reporter.report_failure("reading", &src, e),
         }
     }
 
     let mut outputs: HashMap<PathBuf, PathBuf> = HashMap::new();
     let mut jobs = Vec::new();
-    for src in inputs {
-        let dst = determine_output_path(&src, output_dir);
+    for (src, canonical, format) in inputs {
+        let dst = determine_output_path(&src, format, output_dir);
         let normalized = match normalize_path(&dst) {
             Ok(normalized) => normalized,
             Err(e) => {
@@ -251,6 +302,16 @@ fn plan_jobs(
             ));
             continue;
         }
+        // 出力先が入力自身の場合は上で除いているので、ここで見つかるのは拡張子を .zip にした
+        // 出力先（入力がシンボリックリンクなら、リンク先と名前が違う場合も含む）
+        if output_dir.is_some() && output_exists_in_input_dir(&src, &canonical, &dst) {
+            reporter.report_error(format!(
+                "Skipping {}: output {} already exists in the input directory",
+                src.display(),
+                dst.display()
+            ));
+            continue;
+        }
         match outputs.entry(normalized) {
             Entry::Occupied(other) => reporter.report_error(format!(
                 "Skipping {}: output {} is also the output of {}",
@@ -260,8 +321,9 @@ fn plan_jobs(
             )),
             Entry::Vacant(entry) => {
                 entry.insert(src.clone());
-                jobs.push(ZipJob {
+                jobs.push(ArchiveJob {
                     src_file: src,
+                    format,
                     dst_file: dst,
                 });
             }
@@ -272,9 +334,9 @@ fn plan_jobs(
 }
 
 fn spawn_size_check_thread(
-    jobs: Vec<ZipJob>,
+    jobs: Vec<ArchiveJob>,
     reporter: &Reporter,
-) -> (JoinHandle<Result<()>>, Receiver<ZipJob>) {
+) -> (JoinHandle<Result<()>>, Receiver<ArchiveJob>) {
     let pb = reporter.add_stage_bar("Size checking", jobs.len() as u64);
 
     let reporter = reporter.clone();
@@ -283,15 +345,15 @@ fn spawn_size_check_thread(
         let total = jobs.len();
         let mut to_convert = 0;
         for job in jobs {
-            let zipfile = &job.src_file;
-            pb.set_message(zipfile.to_string_lossy().into_owned());
-            match calc_average_size_per_file(zipfile) {
+            let src_file = &job.src_file;
+            pb.set_message(src_file.to_string_lossy().into_owned());
+            match calc_average_size_per_file(src_file, job.format) {
                 Ok(size_per_file) if size_per_file > MIN_AVERAGE_FILE_SIZE => {
                     to_convert += 1;
                     tx.send(job)?;
                 }
                 Err(e) => {
-                    reporter.report_failure("calculating size for", zipfile, e);
+                    reporter.report_failure("calculating size for", src_file, e);
                 }
                 _ => {}
             }
@@ -306,15 +368,15 @@ fn spawn_size_check_thread(
     (handle, rx)
 }
 
-/// zip を一時ディレクトリへ展開する
-fn extract_zip(src_file: &Path, pb: &ProgressBar) -> Result<tempfile::TempDir> {
+/// アーカイブを一時ディレクトリへ展開する
+fn extract_archive(job: &ArchiveJob, pb: &ProgressBar) -> Result<tempfile::TempDir> {
     let work_dir = tempfile::tempdir().context("failed to create a temporary directory")?;
-    zip_util::unzip_with_progress(src_file, work_dir.path(), pb.clone())?;
+    archive::extract_with_progress(&job.src_file, work_dir.path(), job.format, pb.clone())?;
     Ok(work_dir)
 }
 
-fn spawn_zip_extraction_thread(
-    size_check_rx: Receiver<ZipJob>,
+fn spawn_extraction_thread(
+    size_check_rx: Receiver<ArchiveJob>,
     reporter: &Reporter,
 ) -> (JoinHandle<Result<()>>, Receiver<ProcessingContext>) {
     let pb = reporter.add_stage_bar("Extracting", 0);
@@ -325,7 +387,7 @@ fn spawn_zip_extraction_thread(
         for job in size_check_rx {
             pb.set_message(job.src_file.to_string_lossy().into_owned());
             // 1 ファイルの失敗で全体を止めず、次のファイルへ進む
-            let work_dir = match extract_zip(&job.src_file, &pb) {
+            let work_dir = match extract_archive(&job, &pb) {
                 Ok(work_dir) => work_dir,
                 Err(e) => {
                     reporter.report_failure("extracting", &job.src_file, e);
@@ -343,7 +405,7 @@ fn spawn_zip_extraction_thread(
 
 fn spawn_image_resizing_thread(
     max_height: u32,
-    zip_extraction_rx: Receiver<ProcessingContext>,
+    extraction_rx: Receiver<ProcessingContext>,
     reporter: &Reporter,
 ) -> (JoinHandle<Result<()>>, Receiver<ProcessingContext>) {
     let pb = reporter.add_stage_bar("Resizing images", 0);
@@ -351,7 +413,7 @@ fn spawn_image_resizing_thread(
     let reporter = reporter.clone();
     let (tx, rx) = mpsc::sync_channel(MAX_PENDING_WORK_DIRS);
     let handle = std::thread::spawn(move || {
-        for ctx in zip_extraction_rx {
+        for ctx in extraction_rx {
             pb.set_message(ctx.job.src_file.to_string_lossy().into_owned());
             let files: Vec<_> = match fs_util::scan_regular_files(ctx.work_dir.path()).collect() {
                 Ok(files) => files,
@@ -365,7 +427,7 @@ fn spawn_image_resizing_thread(
                     if !outcome.failed.is_empty() {
                         reporter.report_error(format_conversion_failures(&ctx, &outcome));
                     }
-                    // 1 枚も変換されなかった zip は出力しない
+                    // 1 枚も変換されなかったアーカイブは出力しない
                     if outcome.converted > 0 {
                         tx.send(ctx)?;
                     }
@@ -475,7 +537,7 @@ fn run_with(args: Args) -> Result<()> {
         output_dir,
         max_height,
         keep_mtime,
-        zipfiles,
+        archives,
     } = args;
 
     // 展開・変換を始める前に出力先を検証する
@@ -490,20 +552,19 @@ fn run_with(args: Args) -> Result<()> {
     }
 
     let reporter = Reporter::new();
-    let jobs = plan_jobs(zipfiles, output_dir.as_deref(), &reporter);
+    let jobs = plan_jobs(archives, output_dir.as_deref(), &reporter);
 
     let (size_check_handle, size_check_rx) = spawn_size_check_thread(jobs, &reporter);
-    let (zip_extraction_handle, zip_extraction_rx) =
-        spawn_zip_extraction_thread(size_check_rx, &reporter);
+    let (extraction_handle, extraction_rx) = spawn_extraction_thread(size_check_rx, &reporter);
     let (image_resizing_handle, image_resizing_rx) =
-        spawn_image_resizing_thread(max_height, zip_extraction_rx, &reporter);
+        spawn_image_resizing_thread(max_height, extraction_rx, &reporter);
     let zip_creation_handle = spawn_zip_creation_thread(keep_mtime, image_resizing_rx, &reporter);
 
     // 途中で return すると残りのスレッドが強制終了され、
     // 書きかけの zip が残るため、まず全スレッドの終了を待つ
     let results = [
         size_check_handle.join(),
-        zip_extraction_handle.join(),
+        extraction_handle.join(),
         image_resizing_handle.join(),
         zip_creation_handle.join(),
     ];
@@ -553,15 +614,45 @@ mod tests {
 
     #[test]
     fn test_determine_output_path() {
-        let src = Path::new("/path1/path2/test.zip");
+        use super::ArchiveFormat::{Rar, Zip};
+
+        let src = Path::new("/path1/path2/test.cbz");
 
         // 出力先ディレクトリ指定時はファイル名だけを引き継ぐ
-        let path = super::determine_output_path(src, Some(Path::new("/out")));
-        assert_eq!(path, Path::new("/out/test.zip"));
+        let path = super::determine_output_path(src, Zip, Some(Path::new("/out")));
+        assert_eq!(path, Path::new("/out/test.cbz"));
 
         // 未指定時は元ファイル名に _resized を付ける
-        let path = super::determine_output_path(src, None);
-        assert_eq!(path, Path::new("/path1/path2/test_resized.zip"));
+        let path = super::determine_output_path(src, Zip, None);
+        assert_eq!(path, Path::new("/path1/path2/test_resized.cbz"));
+
+        // RAR の出力は zip なので、拡張子を .zip にする
+        for src in [
+            "/path1/path2/test.rar",
+            "/path1/path2/test.cbr",
+            "/path1/path2/test.RAR",
+        ] {
+            let src = Path::new(src);
+            let path = super::determine_output_path(src, Rar, Some(Path::new("/out")));
+            assert_eq!(path, Path::new("/out/test.zip"));
+            let path = super::determine_output_path(src, Rar, None);
+            assert_eq!(path, Path::new("/path1/path2/test_resized.zip"));
+        }
+
+        // .rar / .cbr 以外の拡張子は名前の一部として残す（Vol.1 と Vol.2 が同じ出力にならない）
+        let src = Path::new("/path1/path2/Vol.1");
+        let path = super::determine_output_path(src, Rar, Some(Path::new("/out")));
+        assert_eq!(path, Path::new("/out/Vol.1.zip"));
+        let path = super::determine_output_path(src, Rar, None);
+        assert_eq!(path, Path::new("/path1/path2/Vol_resized.1.zip"));
+
+        // 中身が RAR で拡張子が .zip / .cbz の場合も、.zip を重ねない
+        let path = super::determine_output_path(Path::new("/p/test.cbz"), Rar, None);
+        assert_eq!(path, Path::new("/p/test_resized.zip"));
+
+        // 中身が zip で拡張子が .cbr の場合も、出力は zip なので拡張子を .zip にする
+        let path = super::determine_output_path(Path::new("/p/test.cbr"), Zip, None);
+        assert_eq!(path, Path::new("/p/test_resized.zip"));
     }
 
     #[test]
@@ -608,12 +699,14 @@ mod tests {
         assert_eq!(
             jobs,
             [
-                super::ZipJob {
+                super::ArchiveJob {
                     src_file: zipfiles[0].clone(),
+                    format: super::ArchiveFormat::Zip,
                     dst_file: out.join("a.zip"),
                 },
-                super::ZipJob {
+                super::ArchiveJob {
                     src_file: zipfiles[1].clone(),
+                    format: super::ArchiveFormat::Zip,
                     dst_file: out.join("b.zip"),
                 },
             ]
@@ -656,6 +749,128 @@ mod tests {
         assert_eq!(errors, 1);
     }
 
+    /// `testdata/basic.rar` を `dir` に `dest_name` という名前でコピーし、そのパスを返す
+    fn copy_rar_fixture(dir: &Path, dest_name: &str) -> PathBuf {
+        let path = dir.join(dest_name);
+        std::fs::copy(crate::test_util::fixture("basic.rar"), &path).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_plan_jobs_rar() {
+        // 形式は中身で判定し、RAR の出力先は拡張子を .zip にする
+        let dir = tempfile::tempdir().unwrap();
+        let src = copy_rar_fixture(dir.path(), "a.cbr");
+
+        let reporter = super::Reporter::new();
+        let jobs = super::plan_jobs(vec![src.clone()], None, &reporter);
+        assert_eq!(reporter.error_count(), 0);
+        assert_eq!(
+            jobs,
+            [super::ArchiveJob {
+                src_file: src,
+                format: super::ArchiveFormat::Rar,
+                dst_file: dir.path().join("a_resized.zip"),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_plan_jobs_rar_output_exists_in_input_dir() {
+        // -d に入力元と同じディレクトリを指定すると、a.rar の出力先は隣の a.zip になる。
+        // 入力に含まれていなくても同じ本の zip 版の原本かもしれないので、上書きしない
+        let dir = tempfile::tempdir().unwrap();
+        let src = copy_rar_fixture(dir.path(), "a.rar");
+        let other = copy_rar_fixture(dir.path(), "b.rar");
+        touch_files(dir.path(), &["a.zip"]);
+
+        let (srcs, errors) = plan(
+            vec![src.clone(), other.clone()],
+            Some(dir.path().to_path_buf()),
+        );
+        assert_eq!(srcs, [other]);
+        assert_eq!(errors, 1);
+
+        // 中身が zip の c.cbr も出力先が c.zip になるので、同様に上書きしない
+        let cbr = touch_files(dir.path(), &["c.cbr", "c.zip"]).remove(0);
+        let (srcs, errors) = plan(vec![cbr], Some(dir.path().to_path_buf()));
+        assert!(srcs.is_empty());
+        assert_eq!(errors, 1);
+
+        // 別のディレクトリへの出力では、既存の出力は従来どおり上書きする
+        let out = dir.path().join("out");
+        touch_files(&out, &["a.zip"]);
+        let (srcs, errors) = plan(vec![src], Some(out));
+        assert_eq!(srcs.len(), 1);
+        assert_eq!(errors, 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_plan_jobs_rar_output_exists_next_to_symlink() {
+        // 入力がシンボリックリンクでも、リンクのあるディレクトリの a.zip を上書きしない
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let target = copy_rar_fixture(&real, "a.rar");
+        let books = dir.path().join("books");
+        touch_files(&books, &["a.zip"]);
+        let link = books.join("a.rar");
+        std::os::unix::fs::symlink(target, &link).unwrap();
+
+        let (srcs, errors) = plan(vec![link], Some(books));
+        assert!(srcs.is_empty());
+        assert_eq!(errors, 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_plan_jobs_rar_symlink_named_zip() {
+        // 中身が RAR の real/a.rar を books/a.zip というリンクで渡し、-d にリンク先の
+        // ディレクトリを指定しても、real/a.zip を上書きしない
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let target = copy_rar_fixture(&real, "a.rar");
+        touch_files(&real, &["a.zip"]);
+        let books = dir.path().join("books");
+        std::fs::create_dir(&books).unwrap();
+        let link = books.join("a.zip");
+        std::os::unix::fs::symlink(target, &link).unwrap();
+
+        let (srcs, errors) = plan(vec![link], Some(real));
+        assert!(srcs.is_empty());
+        assert_eq!(errors, 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_plan_jobs_rar_existing_output_is_symlink() {
+        // 入力元にある a.zip が別の場所へのシンボリックリンクでも、上書きしない
+        let dir = tempfile::tempdir().unwrap();
+        let target = touch_files(dir.path(), &["library/a.zip"]).remove(0);
+        let books = dir.path().join("books");
+        std::fs::create_dir(&books).unwrap();
+        let src = copy_rar_fixture(&books, "a.rar");
+        std::os::unix::fs::symlink(target, books.join("a.zip")).unwrap();
+
+        let (srcs, errors) = plan(vec![src], Some(books));
+        assert!(srcs.is_empty());
+        assert_eq!(errors, 1);
+    }
+
+    #[test]
+    fn test_plan_jobs_zip_and_rar_same_output() {
+        // a.zip と a.rar はどちらも出力先が a_resized.zip になるので、先に指定した方だけを処理する
+        let dir = tempfile::tempdir().unwrap();
+        let zip = touch_files(dir.path(), &["a.zip"]).remove(0);
+        let rar = copy_rar_fixture(dir.path(), "a.rar");
+
+        let (srcs, errors) = plan(vec![zip.clone(), rar], None);
+        assert_eq!(srcs, [zip]);
+        assert_eq!(errors, 1);
+    }
+
     #[test]
     fn test_plan_jobs_duplicate_input() {
         // 同じファイルを別の書き方で重複して指定しても、エラーにせず 1 つにまとめる
@@ -689,7 +904,11 @@ mod tests {
         std::fs::write(work_dir.path().join("001.webp"), b"image").unwrap();
         super::ProcessingContext {
             work_dir,
-            job: super::ZipJob { src_file, dst_file },
+            job: super::ArchiveJob {
+                src_file,
+                format: super::ArchiveFormat::Zip,
+                dst_file,
+            },
         }
     }
 
@@ -882,6 +1101,37 @@ mod tests {
         run_cli(&[src.to_str().unwrap()]).unwrap();
 
         assert_eq!(list_names(dir.path()), ["small.zip"]);
+    }
+
+    #[test]
+    fn test_pipeline_converts_rar() {
+        // 処理対象になる（平均 500KB 超の）RAR はフィクスチャとして大きすぎるので、
+        // サイズチェックの後段（展開 → リサイズ → zip 作成）に直接流す
+        let dir = tempfile::tempdir().unwrap();
+        let src = copy_rar_fixture(dir.path(), "book.rar");
+        let reporter = super::Reporter::new();
+        let jobs = super::plan_jobs(vec![src], None, &reporter);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        for job in jobs {
+            tx.send(job).unwrap();
+        }
+        drop(tx);
+        let (extraction, rx) = super::spawn_extraction_thread(rx, &reporter);
+        let (resizing, rx) = super::spawn_image_resizing_thread(1800, rx, &reporter);
+        let creation = super::spawn_zip_creation_thread(false, rx, &reporter);
+        for handle in [extraction, resizing, creation] {
+            handle.join().unwrap().unwrap();
+        }
+        assert_eq!(reporter.error_count(), 0);
+
+        assert_eq!(list_names(dir.path()), ["book.rar", "book_resized.zip"]);
+        let file = std::fs::File::open(dir.path().join("book_resized.zip")).unwrap();
+        let archive = zip::ZipArchive::new(file).unwrap();
+        assert_eq!(
+            archive.file_names().collect::<Vec<_>>(),
+            ["001.webp", "日本語.txt", "sub/", "sub/002.txt"]
+        );
     }
 
     #[test]

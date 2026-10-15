@@ -1,4 +1,5 @@
 pub mod app;
+mod archive;
 mod convert;
 mod fs_util;
 mod image_util;
