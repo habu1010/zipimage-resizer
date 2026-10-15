@@ -78,7 +78,7 @@ struct ProcessingContext {
 ///
 /// ディスクフルなどで大量に失敗しても表示が溢れないよう、個別のファイルは先頭の数件だけ示す。
 /// パスは `ResizeOutcome::failed` のアーカイブ内のパスをそのまま示す。
-fn format_conversion_failures(ctx: &ProcessingContext, outcome: &ResizeOutcome) -> String {
+fn format_conversion_failures(src_file: &Path, outcome: &ResizeOutcome) -> String {
     use std::fmt::Write as _;
 
     const MAX_LISTED: usize = 5;
@@ -88,7 +88,7 @@ fn format_conversion_failures(ctx: &ProcessingContext, outcome: &ResizeOutcome) 
     let mut msg = format!(
         "Failed to convert {} of {total} image(s) in {}",
         failed.len(),
-        ctx.job.src_file.display()
+        src_file.display()
     );
     if outcome.converted > 0 {
         msg.push_str(" (written with the originals kept)");
@@ -198,7 +198,8 @@ fn spawn_image_resizing_thread(
             match resize_image_files(ctx.work_dir.path(), max_height, pb.clone()) {
                 Ok(outcome) => {
                     if !outcome.failed.is_empty() {
-                        reporter.report_error(format_conversion_failures(&ctx, &outcome));
+                        let msg = format_conversion_failures(&ctx.job.src_file, &outcome);
+                        reporter.report_error(msg);
                     }
                     // 1 枚も変換されなかったアーカイブは出力しない
                     if outcome.converted > 0 {
@@ -364,7 +365,6 @@ mod tests {
     #[test]
     fn test_format_conversion_failures() {
         // zip 内のパスで、先頭の 5 件だけを示す
-        let ctx = processing_context(PathBuf::from("book.zip"), PathBuf::from("out.zip"));
         let failed = (1..=7)
             .map(|i| {
                 let file = PathBuf::from(format!("{i:03}.png"));
@@ -377,7 +377,7 @@ mod tests {
         };
 
         assert_eq!(
-            super::format_conversion_failures(&ctx, &outcome),
+            super::format_conversion_failures(Path::new("book.zip"), &outcome),
             "Failed to convert 7 of 10 image(s) in book.zip (written with the originals kept):\n  \
              001.png: broken\n  002.png: broken\n  003.png: broken\n  004.png: broken\n  \
              005.png: broken\n  ... and 2 more"
