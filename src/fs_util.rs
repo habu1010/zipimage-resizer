@@ -61,6 +61,18 @@ pub fn temp_file_beside(dst: &Path) -> anyhow::Result<tempfile::NamedTempFile> {
         .with_context(|| format!("failed to create a temporary file in {}", dir.display()))
 }
 
+/// `src` の最終更新日時を `dst` に設定する
+///
+/// `dst` に書き込むと更新日時が変わるので、書き込みを終えてから呼ぶこと。
+pub fn copy_mtime(src: &Path, dst: &std::fs::File) -> anyhow::Result<()> {
+    let mtime = src
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .with_context(|| format!("failed to read the modification time of {}", src.display()))?;
+    dst.set_modified(mtime)
+        .context("failed to set the modification time")
+}
+
 /// 親ディレクトリを返す（`a.zip` のような相対パスのファイル名だけの場合は `.`）
 pub fn parent_dir(path: &Path) -> &Path {
     match path.parent() {
@@ -108,6 +120,28 @@ mod tests {
             let mode = |path: &Path| path.metadata().unwrap().permissions().mode() & 0o777;
             assert_eq!(mode(tmp.path()), mode(&reference));
         }
+    }
+
+    #[test]
+    fn test_copy_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let [src, dst] = crate::test_util::touch_files(dir.path(), &["src", "dst"])
+            .try_into()
+            .unwrap();
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        crate::test_util::set_mtime(&src, mtime);
+
+        let dst_file = std::fs::File::options().write(true).open(&dst).unwrap();
+        super::copy_mtime(&src, &dst_file).unwrap();
+        assert_eq!(dst.metadata().unwrap().modified().unwrap(), mtime);
+
+        // 元ファイルが無ければ、パスを示してエラーにする
+        let missing = dir.path().join("missing");
+        let err = super::copy_mtime(&missing, &dst_file).unwrap_err();
+        assert!(
+            err.to_string().contains(&missing.display().to_string()),
+            "{err:#}"
+        );
     }
 
     #[test]

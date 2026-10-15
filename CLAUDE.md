@@ -38,7 +38,7 @@ cargo fmt                # フォーマット
 - [src/archive.rs](src/archive.rs) — 入力の形式（zip / RAR）の判定（`ArchiveFormat::detect`）と、形式ごとの件数取得・展開への振り分け
 - [src/zip_util.rs](src/zip_util.rs) — zip の展開・作成
 - [src/rar_util.rs](src/rar_util.rs) — RAR のシグネチャによる判定（`is_rar`）と展開
-- [src/fs_util.rs](src/fs_util.rs) — パス・ディレクトリ走査・一時ファイルの小さなヘルパー
+- [src/fs_util.rs](src/fs_util.rs) — パス・ディレクトリ走査・一時ファイル・最終更新日時の小さなヘルパー
 - `src/test_util.rs` — 複数モジュールのテストで共有するヘルパー（`#[cfg(test)]`）
 
 ### 4 段のパイプライン（[src/app.rs](src/app.rs)）

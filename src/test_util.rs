@@ -129,3 +129,13 @@ pub fn write_zip(path: &Path, entries: &[(&str, Vec<u8>)]) {
     }
     zw.finish().unwrap();
 }
+
+/// `path` の最終更新日時を `mtime` にする
+pub fn set_mtime(path: &Path, mtime: std::time::SystemTime) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+}

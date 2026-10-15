@@ -229,21 +229,9 @@ fn create_resized_zip(ctx: &ProcessingContext, keep_mtime: bool, pb: &ProgressBa
     zip_util::zip_with_progress(ctx.work_dir.path(), dst_tempfile.as_file(), pb)
         .context("failed to write the zip")?;
 
+    // 書き終えてから写す（この後の sync_all と rename では更新日時は変わらない）
     if keep_mtime {
-        let src_file = &ctx.job.src_file;
-        let src_mtime = src_file
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .with_context(|| {
-                format!(
-                    "failed to read the modification time of {}",
-                    src_file.display()
-                )
-            })?;
-        dst_tempfile
-            .as_file()
-            .set_modified(src_mtime)
-            .context("failed to set the modification time")?;
+        fs_util::copy_mtime(&ctx.job.src_file, dst_tempfile.as_file())?;
     }
 
     // データをディスクに書き出してから置き換える。そうしないと、電源断などの際に
@@ -334,7 +322,7 @@ mod tests {
 
     use clap::Parser;
 
-    use crate::test_util::{copy_rar_fixture, list_names, touch_files, write_zip};
+    use crate::test_util::{copy_rar_fixture, list_names, set_mtime, touch_files, write_zip};
 
     #[test]
     fn test_args_rejects_zero_max_height() {
@@ -385,12 +373,7 @@ mod tests {
         let src = touch_files(dir.path(), &["a.zip"]).remove(0);
         let old_mtime =
             std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
-        std::fs::File::options()
-            .write(true)
-            .open(&src)
-            .unwrap()
-            .set_modified(old_mtime)
-            .unwrap();
+        set_mtime(&src, old_mtime);
         let dst = dir.path().join("a_resized.zip");
 
         let ctx = processing_context(src, dst.clone());
