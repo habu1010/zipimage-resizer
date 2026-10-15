@@ -6,6 +6,8 @@ use anyhow::Context;
 use indicatif::ProgressBar;
 use ripunzip::{UnzipEngine, UnzipOptions, UnzipProgressReporter};
 
+use crate::fs_util::walk_error_in;
+
 struct UnzipProgressBar(ProgressBar);
 
 impl UnzipProgressReporter for UnzipProgressBar {
@@ -81,7 +83,8 @@ where
             (a.file_type().is_dir(), a.file_name()).cmp(&(b.file_type().is_dir(), b.file_name()))
         })
         .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| walk_error_in(e, src_dir))?;
 
     let file_count = entries.iter().filter(|e| e.file_type().is_file()).count();
     pb.set_position(0);
@@ -185,8 +188,12 @@ mod tests {
         };
 
         let dst = tempfile::tempfile().unwrap();
-        let result = super::zip_with_progress(dir.path(), &dst, &ProgressBar::hidden());
-        assert!(result.is_err());
+        let err = super::zip_with_progress(dir.path(), &dst, &ProgressBar::hidden()).unwrap_err();
+        // 一時ディレクトリの絶対パスではなく、相対パスで示す
+        assert!(
+            format!("{err:#}").starts_with("failed to read sub: "),
+            "{err:#}"
+        );
     }
 
     #[test]
