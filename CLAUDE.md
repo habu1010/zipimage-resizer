@@ -37,7 +37,7 @@ cargo fmt                # フォーマット
 - [src/image_util.rs](src/image_util.rs) — 画像単体の処理（デコード・縮小・WebP エンコード・アニメーション判定）
 - [src/archive.rs](src/archive.rs) — 入力の形式（zip / RAR）の判定（`ArchiveFormat::detect`）と、形式ごとの件数取得・展開への振り分け
 - [src/zip_util.rs](src/zip_util.rs) — zip の展開・作成
-- [src/rar_util.rs](src/rar_util.rs) — RAR の展開
+- [src/rar_util.rs](src/rar_util.rs) — RAR のシグネチャによる判定（`is_rar`）と展開
 - [src/fs_util.rs](src/fs_util.rs) — パスとディレクトリ走査の小さなヘルパー
 - `src/test_util.rs` — 複数モジュールのテストで共有するヘルパー（`#[cfg(test)]`）
 
@@ -78,10 +78,10 @@ cargo fmt                # フォーマット
 
 ### RAR 入力（[src/archive.rs](src/archive.rs), [src/rar_util.rs](src/rar_util.rs)）
 
-- 形式は拡張子ではなく先頭のシグネチャ（`Rar!\x1a\x07`、RAR 1.4 は `RE~^`）で判定する（中身が zip の `.cbr` などもあるため）。RAR でなければ zip として扱う。判定は `plan_jobs` で一度だけ行い、`ArchiveJob::format` に持たせる。
+- 形式は拡張子ではなく先頭のシグネチャ（`Rar!\x1a\x07`、RAR 1.4 は `RE~^`）で判定する（中身が zip の `.cbr` などもあるため。`rar_util::is_rar`）。RAR でなければ zip として扱う。判定は `plan_jobs` で一度だけ行い、`ArchiveJob::format` に持たせる。
 - 展開は `unrar` クレート（公式 UnRAR の C++ ソースを同梱して静的リンクするため、ビルドに C++ コンパイラが必要）。分割 RAR は非対応で、件数取得の時点（サイズチェック段）でエラーにする。エントリの境界で切れた RAR（ダウンロード途中など）は UnRAR では正常終了と区別できないので、RAR5 は末尾 64 バイト以内に終端ヘッダ（CRC 付き）があることを自前で確かめ（後ろの余分なデータは許す）、無ければ同じく件数取得の時点でエラーにする（`ensure_rar5_complete`）。RAR4 は終端ヘッダの無い古い形式（RAR 2.x）もあるので確かめない。パスワード付きはエラーとして報告される（中身だけ暗号化したもの（`-p`）は展開時、ヘッダまで暗号化したもの（`-hp`）は件数取得の時点）。
 - `unrar` は Linux では展開先のフルパスを UnRAR にそのまま渡すため、UnRAR が展開先を知らない（ファイル参照・ハードリンクの参照先をカレントディレクトリから探す、パスの正規化が効かない）。そこで UnRAR にはファイルを作らせず、各エントリを `read()` でメモリに読み出して自前で書き出す。`..` や絶対パスのエントリは `entry_dest_path` で弾く。ファイル参照・ハードリンク・シンボリックリンクはエラーにする（リンクは一切作らない）。UnRAR はこれらの中身を展開せず空で返す（RAR4 のシンボリックリンクも同様）ので、「元のサイズがあるのに空」で検出する。`file_attr` はヘッダの生の値で、作成元の OS によって意味が違う（Windows なら Windows の属性）ため判定に使わない。
-- unrar 0.5.8 は知らないエラーコード（辞書が大きすぎる場合の ERAR_LARGE_DICT など）で panic するので、`rar_util` の公開関数は `catch_panic` で panic をエラーに変える（1 ファイルのためにパイプライン全体を止めない）。その際、既定の panic フックが stderr に直接書いてプログレスバーを崩さないよう、`catch_panic` の中の panic ではフックの出力を抑える。
+- unrar 0.5.8 は知らないエラーコード（辞書が大きすぎる場合の ERAR_LARGE_DICT など）で panic するので、`rar_util` の unrar を呼ぶ公開関数は `catch_panic` で panic をエラーに変える（1 ファイルのためにパイプライン全体を止めない）。その際、既定の panic フックが stderr に直接書いてプログレスバーを崩さないよう、`catch_panic` の中の panic ではフックの出力を抑える。
 - `-d` に入力元と同じディレクトリを指定し、拡張子を変えた出力先（`a.rar` → `a.zip`）が既に存在する場合は処理しない（入力に含まれていなくても、同じ本の zip 版の原本かもしれないため）。入力や既存の出力がシンボリックリンクでも、リンク自体の置き場所で比べる（入力はリンク先のディレクトリも入力元とみなす）。`a.zip` と `a.rar` を両方渡した場合は、出力先の重複として先に指定した方だけを処理する。
 - テスト用の RAR は `testdata/` にコミットしてある（テスト実行時に `rar` コマンドを要求しないため）。作り直すときは `rar` を入れて `sh testdata/make_fixtures.sh`。RAR 7 は RAR4 形式で作成できないので、フィクスチャは RAR5 のみ。
 

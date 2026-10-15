@@ -11,7 +11,22 @@ use unrar::{Archive, VolumeInfo};
 use crate::fs_util::parent_dir;
 
 /// RAR5 の先頭のシグネチャ
-pub const RAR5_SIGNATURE: &[u8] = b"Rar!\x1a\x07\x01\x00";
+const RAR5_SIGNATURE: &[u8] = b"Rar!\x1a\x07\x01\x00";
+/// RAR 1.5 以降の先頭のシグネチャ（RAR 1.5〜4.x は続けて `\x00`、RAR5 は `\x01\x00`）
+const RAR_SIGNATURE: &[u8] = RAR5_SIGNATURE.split_at(6).0;
+/// RAR 1.4 の先頭のシグネチャ
+const RAR14_SIGNATURE: &[u8] = b"RE~^";
+
+/// ファイルの先頭のシグネチャが RAR のものか
+///
+/// シグネチャより短いファイル（空ファイルなど）はエラーにせず、RAR でないとする。
+pub fn is_rar(path: &Path) -> std::io::Result<bool> {
+    let mut head = Vec::with_capacity(RAR_SIGNATURE.len());
+    File::open(path)?
+        .take(RAR_SIGNATURE.len() as u64)
+        .read_to_end(&mut head)?;
+    Ok(head.starts_with(RAR_SIGNATURE) || head.starts_with(RAR14_SIGNATURE))
+}
 
 thread_local! {
     /// このスレッドで `catch_panic` の中を実行しているか
@@ -215,6 +230,25 @@ mod tests {
     use indicatif::ProgressBar;
 
     use crate::test_util::fixture;
+
+    #[test]
+    fn test_is_rar() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, content, expected) in [
+            ("rar5.rar", &b"Rar!\x1a\x07\x01\x00rest"[..], true),
+            ("rar4.rar", b"Rar!\x1a\x07\x00rest", true),
+            ("rar14.rar", b"RE~^rest", true),
+            ("zip.rar", b"PK\x03\x04rest", false),
+            // シグネチャより短いファイルも、エラーにせず RAR でないとする
+            ("short.rar", b"Rar", false),
+            ("empty.rar", b"", false),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, content).unwrap();
+            assert_eq!(super::is_rar(&path).unwrap(), expected, "{name}");
+        }
+        assert!(super::is_rar(&dir.path().join("missing.rar")).is_err());
+    }
 
     #[test]
     fn test_file_count() {
