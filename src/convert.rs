@@ -19,31 +19,6 @@ use crate::webp_names::rename_to_final_names;
 /// WebP は変換しない。
 const MAX_WEBP_SIZE: usize = 1024 * 1024; // 1MB
 
-#[allow(dead_code)]
-fn resize_image_file_jpg<P: AsRef<Path>>(path: P, max_height: u32) -> image::ImageResult<()> {
-    let Ok(image) = image::open(path.as_ref()) else {
-        return Ok(());
-    };
-
-    println!("resize image: {:?}", path.as_ref());
-    std::fs::remove_file(path.as_ref())?;
-    let resized_image = image.reduce_size(max_height);
-
-    let writer =
-        std::io::BufWriter::new(std::fs::File::create(path.as_ref().with_extension("jpg"))?);
-    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(writer, 95);
-
-    // エンコード（ファイルへの書き込み）
-    enc.encode(
-        resized_image.as_bytes(),
-        resized_image.width(),
-        resized_image.height(),
-        resized_image.color().into(),
-    )
-
-    // resized_image.save(path.as_ref().with_extension("jpg"))
-}
-
 /// `src` を WebP に変換し、同じディレクトリの一時ファイルに書き出す
 ///
 /// 書き出しに成功してから `src` を削除し、一時ファイルのパスを返す。
