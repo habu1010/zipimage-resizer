@@ -43,7 +43,7 @@ impl ArchiveFormat {
 /// アーカイブに含まれるエントリ数を取得する
 pub fn get_file_count(path: &Path, format: ArchiveFormat) -> anyhow::Result<usize> {
     match format {
-        ArchiveFormat::Zip => Ok(zip_util::get_file_count(path)?),
+        ArchiveFormat::Zip => zip_util::get_file_count(path),
         ArchiveFormat::Rar => rar_util::get_file_count(path),
     }
 }

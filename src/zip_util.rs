@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Context;
 use indicatif::ProgressBar;
@@ -14,39 +14,30 @@ impl UnzipProgressReporter for UnzipProgressBar {
     }
 }
 
-/// zipファイルに含まれるファイル数を取得する
-/// # Arguments
-/// * `zip_file` - ファイル数を取得するzipファイル
-/// # Returns
-/// ファイル数
+/// zip に含まれるエントリ数（ディレクトリを含む）を取得する
+///
 /// # Errors
-/// zipファイルが存在しない場合、またはzipファイルが壊れている場合にエラーを返す
-pub fn get_file_count<P: AsRef<Path>>(zip_file: P) -> zip::result::ZipResult<usize> {
+/// zip が存在しない・壊れている場合にエラーを返す
+pub fn get_file_count(zip_file: &Path) -> anyhow::Result<usize> {
     let file = File::open(zip_file)?;
     let archive = zip::ZipArchive::new(file)?;
 
     Ok(archive.len())
 }
 
-/// zipファイルを解凍する
-///
-/// # Arguments
-///
-/// * `zip_file` - 解凍するzipファイル
-/// * `output_dir` - 解凍先のディレクトリ
-/// * `pb` - 進捗表示に使うプログレスバー
-pub fn unzip_with_progress<P1: AsRef<Path>, P2: Into<PathBuf>>(
-    zip_file: P1,
-    output_dir: P2,
+/// zip を `output_dir` に展開し、展開したエントリ数を `pb` に進捗として示す
+pub fn unzip_with_progress(
+    zip_file: &Path,
+    output_dir: &Path,
     pb: ProgressBar,
 ) -> anyhow::Result<()> {
     pb.set_position(0);
-    pb.set_length(get_file_count(&zip_file)? as u64);
+    pb.set_length(get_file_count(zip_file)? as u64);
 
-    let file = File::open(&zip_file)?;
+    let file = File::open(zip_file)?;
     let engine = UnzipEngine::for_file(file)?;
     let options = UnzipOptions {
-        output_directory: Some(output_dir.into()),
+        output_directory: Some(output_dir.to_path_buf()),
         password: None,
         single_threaded: true,
         filename_filter: None,
@@ -117,22 +108,14 @@ where
     Ok(())
 }
 
-/// 指定したディレクトリをzipファイルに圧縮する
-/// # Arguments
-/// * `src_dir` - 圧縮するディレクトリ
-/// * `dst_file` - 圧縮先のzipファイル
-/// * `pb` - 進捗表示に使うプログレスバー
-pub fn zip_with_progress<P1: AsRef<Path>>(
-    src_dir: P1,
-    dst_file: &File,
-    pb: ProgressBar,
-) -> anyhow::Result<()> {
+/// `src_dir` 以下を zip にして `dst_file` に書き出し、格納したファイル数を `pb` に進捗として示す
+pub fn zip_with_progress(src_dir: &Path, dst_file: &File, pb: ProgressBar) -> anyhow::Result<()> {
     // ZipWriter は小さな書き込み（ヘッダやコピー時の 8KB 単位の書き込み）を大量に行うため、
     // バッファしてシステムコールの回数を減らす
     const WRITE_BUF_SIZE: usize = 1024 * 1024; // 1MB（変換後の WebP 1 枚がほぼ 1 回の書き込みに収まる）
     let mut zw = zip::ZipWriter::new(BufWriter::with_capacity(WRITE_BUF_SIZE, dst_file));
 
-    add_dir_to_zip(&mut zw, src_dir.as_ref(), &pb)?;
+    add_dir_to_zip(&mut zw, src_dir, &pb)?;
 
     // drop 任せにすると書き込みエラーが無視されるので、明示的に flush する
     zw.finish()?.flush()?;
