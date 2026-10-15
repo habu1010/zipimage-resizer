@@ -172,9 +172,9 @@ fn entry_dest_path(output_dir: &Path, name: &Path) -> anyhow::Result<PathBuf> {
 pub fn unrar_with_progress(
     rar_file: &Path,
     output_dir: &Path,
-    pb: ProgressBar,
+    pb: &ProgressBar,
 ) -> anyhow::Result<()> {
-    catch_panic(|| extract_entries(rar_file, output_dir, &pb))
+    catch_panic(|| extract_entries(rar_file, output_dir, pb))
 }
 
 fn extract_entries(rar_file: &Path, output_dir: &Path, pb: &ProgressBar) -> anyhow::Result<()> {
@@ -231,7 +231,7 @@ mod tests {
         for name in ["basic.rar", "solid.rar"] {
             let dir = tempfile::tempdir().unwrap();
             let pb = ProgressBar::hidden();
-            super::unrar_with_progress(&fixture(name), dir.path(), pb.clone()).unwrap();
+            super::unrar_with_progress(&fixture(name), dir.path(), &pb).unwrap();
 
             assert_eq!(pb.position(), 4, "{name}");
             assert_eq!(
@@ -262,7 +262,7 @@ mod tests {
 
             let dir = tempfile::tempdir().unwrap();
             let result =
-                super::unrar_with_progress(&fixture(name), dir.path(), ProgressBar::hidden());
+                super::unrar_with_progress(&fixture(name), dir.path(), &ProgressBar::hidden());
             assert!(result.is_err(), "{name}");
         }
     }
@@ -273,7 +273,7 @@ mod tests {
         let result = super::unrar_with_progress(
             &fixture("encrypted.rar"),
             dir.path(),
-            ProgressBar::hidden(),
+            &ProgressBar::hidden(),
         );
         assert!(result.is_err());
 
@@ -291,7 +291,7 @@ mod tests {
             std::fs::write(&path, &data[..len]).unwrap();
             assert!(super::get_file_count(&path).is_err(), "{len}");
             let out = tempfile::tempdir().unwrap();
-            let result = super::unrar_with_progress(&path, out.path(), ProgressBar::hidden());
+            let result = super::unrar_with_progress(&path, out.path(), &ProgressBar::hidden());
             assert!(result.is_err(), "{len}");
         }
     }
@@ -350,8 +350,9 @@ mod tests {
         // 参照先をカレントディレクトリから探したり、リンクを作ったりしない
         for name in ["file_ref.rar", "hard_link.rar", "symlink.rar"] {
             let dir = tempfile::tempdir().unwrap();
-            let err = super::unrar_with_progress(&fixture(name), dir.path(), ProgressBar::hidden())
-                .unwrap_err();
+            let err =
+                super::unrar_with_progress(&fixture(name), dir.path(), &ProgressBar::hidden())
+                    .unwrap_err();
             assert!(
                 err.to_string()
                     .starts_with("unsupported entry (file reference or link): "),

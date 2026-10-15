@@ -29,7 +29,7 @@ pub fn get_file_count(zip_file: &Path) -> anyhow::Result<usize> {
 pub fn unzip_with_progress(
     zip_file: &Path,
     output_dir: &Path,
-    pb: ProgressBar,
+    pb: &ProgressBar,
 ) -> anyhow::Result<()> {
     pb.set_position(0);
     pb.set_length(get_file_count(zip_file)? as u64);
@@ -109,13 +109,13 @@ where
 }
 
 /// `src_dir` 以下を zip にして `dst_file` に書き出し、格納したファイル数を `pb` に進捗として示す
-pub fn zip_with_progress(src_dir: &Path, dst_file: &File, pb: ProgressBar) -> anyhow::Result<()> {
+pub fn zip_with_progress(src_dir: &Path, dst_file: &File, pb: &ProgressBar) -> anyhow::Result<()> {
     // ZipWriter は小さな書き込み（ヘッダやコピー時の 8KB 単位の書き込み）を大量に行うため、
     // バッファしてシステムコールの回数を減らす
     const WRITE_BUF_SIZE: usize = 1024 * 1024; // 1MB（変換後の WebP 1 枚がほぼ 1 回の書き込みに収まる）
     let mut zw = zip::ZipWriter::new(BufWriter::with_capacity(WRITE_BUF_SIZE, dst_file));
 
-    add_dir_to_zip(&mut zw, src_dir, &pb)?;
+    add_dir_to_zip(&mut zw, src_dir, pb)?;
 
     // drop 任せにすると書き込みエラーが無視されるので、明示的に flush する
     zw.finish()?.flush()?;
@@ -136,7 +136,7 @@ mod tests {
         std::fs::write(dir.path().join("sub/b.txt"), b"text").unwrap();
 
         let dst = tempfile::tempfile().unwrap();
-        super::zip_with_progress(dir.path(), &dst, ProgressBar::hidden()).unwrap();
+        super::zip_with_progress(dir.path(), &dst, &ProgressBar::hidden()).unwrap();
 
         let mut archive = zip::ZipArchive::new(&dst).unwrap();
         let names: Vec<_> = archive.file_names().map(str::to_owned).collect();
@@ -161,7 +161,7 @@ mod tests {
         };
 
         let dst = tempfile::tempfile().unwrap();
-        let result = super::zip_with_progress(dir.path(), &dst, ProgressBar::hidden());
+        let result = super::zip_with_progress(dir.path(), &dst, &ProgressBar::hidden());
         assert!(result.is_err());
     }
 
@@ -182,7 +182,7 @@ mod tests {
         );
 
         let dst = tempfile::tempfile().unwrap();
-        super::zip_with_progress(dir.path(), &dst, ProgressBar::hidden()).unwrap();
+        super::zip_with_progress(dir.path(), &dst, &ProgressBar::hidden()).unwrap();
 
         let archive = zip::ZipArchive::new(&dst).unwrap();
         let names: Vec<_> = archive.file_names().collect();

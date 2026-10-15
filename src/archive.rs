@@ -53,7 +53,7 @@ pub fn extract_with_progress(
     path: &Path,
     output_dir: &Path,
     format: ArchiveFormat,
-    pb: ProgressBar,
+    pb: &ProgressBar,
 ) -> anyhow::Result<()> {
     match format {
         ArchiveFormat::Zip => zip_util::unzip_with_progress(path, output_dir, pb),

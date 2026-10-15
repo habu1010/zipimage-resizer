@@ -151,7 +151,7 @@ fn spawn_size_check_thread(
 /// アーカイブを一時ディレクトリへ展開する
 fn extract_archive(job: &ArchiveJob, pb: &ProgressBar) -> Result<tempfile::TempDir> {
     let work_dir = tempfile::tempdir().context("failed to create a temporary directory")?;
-    archive::extract_with_progress(&job.src_file, work_dir.path(), job.format, pb.clone())?;
+    archive::extract_with_progress(&job.src_file, work_dir.path(), job.format, pb)?;
     Ok(work_dir)
 }
 
@@ -245,7 +245,7 @@ fn create_resized_zip(ctx: &ProcessingContext, keep_mtime: bool, pb: &ProgressBa
         .tempfile_in(dst_dir)
         .with_context(|| format!("failed to create a temporary file in {}", dst_dir.display()))?;
 
-    zip_util::zip_with_progress(ctx.work_dir.path(), dst_tempfile.as_file(), pb.clone())
+    zip_util::zip_with_progress(ctx.work_dir.path(), dst_tempfile.as_file(), pb)
         .context("failed to write the zip")?;
 
     if keep_mtime {
