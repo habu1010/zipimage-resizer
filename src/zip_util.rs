@@ -93,17 +93,33 @@ where
     for entry in &entries {
         let path = entry.path();
         let filepath = relative_path(path, src_dir);
-        if entry.file_type().is_dir() {
-            zw.add_directory(filepath, zip::write::SimpleFileOptions::default())?;
-        } else if entry.file_type().is_file() {
+        let file_type = entry.file_type();
+        let added = if file_type.is_dir() {
+            zw.add_directory(&*filepath, zip::write::SimpleFileOptions::default())
+                .map_err(anyhow::Error::from)
+        } else if file_type.is_file() {
+            add_file(zw, &filepath, path)
+        } else {
+            continue;
+        };
+        // 書き込みのエラー（ディスクフルなど）もここで出るので、このエントリが原因とは限らない
+        added.with_context(|| format!("failed while adding {filepath}"))?;
+        if file_type.is_file() {
             pb.inc(1);
-            let mut file =
-                std::fs::File::open(path).with_context(|| format!("failed to read {filepath}"))?;
-            zw.start_file(filepath, get_options(path))?;
-            std::io::copy(&mut file, zw)?;
         }
     }
 
+    Ok(())
+}
+
+/// `path` のファイルを `name` として `zw` に追加する
+fn add_file<W>(zw: &mut zip::ZipWriter<W>, name: &str, path: &Path) -> anyhow::Result<()>
+where
+    W: std::io::Write + std::io::Seek,
+{
+    let mut file = File::open(path).context("failed to open")?;
+    zw.start_file(name, get_options(path))?;
+    std::io::copy(&mut file, zw)?;
     Ok(())
 }
 
@@ -192,6 +208,24 @@ mod tests {
         // 一時ディレクトリの絶対パスではなく、相対パスで示す
         assert!(
             format!("{err:#}").starts_with("failed to read sub: "),
+            "{err:#}"
+        );
+    }
+
+    // 読めないファイルがあれば、どのファイルかを示してエラーにする
+    #[test]
+    #[cfg(unix)]
+    fn test_zip_with_progress_reports_unreadable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = crate::test_util::touch_files(dir.path(), &["sub/a.txt"]).remove(0);
+        let Some(_restore) = crate::test_util::make_unreadable(&file) else {
+            return;
+        };
+
+        let dst = tempfile::tempfile().unwrap();
+        let err = super::zip_with_progress(dir.path(), &dst, &ProgressBar::hidden()).unwrap_err();
+        assert!(
+            format!("{err:#}").starts_with("failed while adding sub/a.txt: failed to open: "),
             "{err:#}"
         );
     }
