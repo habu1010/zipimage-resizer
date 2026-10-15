@@ -125,7 +125,7 @@ fn spawn_size_check_thread(
         let mut to_convert = 0;
         for job in jobs {
             let src_file = &job.src_file;
-            pb.set_message(src_file.to_string_lossy().into_owned());
+            pb.set_message(src_file.display().to_string());
             match calc_average_size_per_file(src_file, job.format) {
                 Ok(size_per_file) if size_per_file > MIN_AVERAGE_FILE_SIZE => {
                     to_convert += 1;
@@ -164,7 +164,7 @@ fn spawn_extraction_thread(
     let (tx, rx) = mpsc::sync_channel(MAX_PENDING_WORK_DIRS);
     let handle = std::thread::spawn(move || {
         for job in size_check_rx {
-            pb.set_message(job.src_file.to_string_lossy().into_owned());
+            pb.set_message(job.src_file.display().to_string());
             // 1 ファイルの失敗で全体を止めず、次のファイルへ進む
             let work_dir = match extract_archive(&job, &pb) {
                 Ok(work_dir) => work_dir,
@@ -193,7 +193,7 @@ fn spawn_image_resizing_thread(
     let (tx, rx) = mpsc::sync_channel(MAX_PENDING_WORK_DIRS);
     let handle = std::thread::spawn(move || {
         for ctx in extraction_rx {
-            pb.set_message(ctx.job.src_file.to_string_lossy().into_owned());
+            pb.set_message(ctx.job.src_file.display().to_string());
             match resize_image_files(ctx.work_dir.path(), max_height, pb.clone()) {
                 Ok(outcome) => {
                     if !outcome.failed.is_empty() {
@@ -260,7 +260,7 @@ fn spawn_zip_creation_thread(
     let reporter = reporter.clone();
     std::thread::spawn(move || {
         for ctx in image_resizing_rx {
-            pb.set_message(ctx.job.dst_file.to_string_lossy().into_owned());
+            pb.set_message(ctx.job.dst_file.display().to_string());
             if let Err(e) = create_resized_zip(&ctx, keep_mtime, &pb) {
                 reporter.report_failure("creating", &ctx.job.dst_file, e);
             }
