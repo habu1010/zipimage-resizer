@@ -34,13 +34,17 @@ impl Reporter {
     }
 
     /// パイプラインの段ごとの進捗表示を追加する（`label` は表示の先頭に付く段の名前）
-    pub fn add_stage_bar(&self, label: &str, len: u64) -> ProgressBar {
+    ///
+    /// 件数がまだ分からない段は `len` を `None` にする（0 にすると indicatif はバーを満杯で
+    /// 描くので、始まる前から完了に見えてしまう）。
+    pub fn add_stage_bar(&self, label: &str, len: Option<u64>) -> ProgressBar {
         let style = ProgressStyle::with_template(
             "{prefix} [{bar:20.cyan/blue}] {pos}/{len} ETA:{eta} {msg}",
         )
         .unwrap()
         .progress_chars("#>-");
-        let pb = ProgressBar::new(len)
+        let pb = len
+            .map_or_else(ProgressBar::no_length, ProgressBar::new)
             .with_style(style)
             .with_prefix(label.to_string());
         self.mp.add(pb)

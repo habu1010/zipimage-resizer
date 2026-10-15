@@ -118,7 +118,7 @@ fn spawn_size_check_thread(
     min_average_file_size: u64,
     reporter: &Reporter,
 ) -> (JoinHandle<Result<()>>, Receiver<ArchiveJob>) {
-    let pb = reporter.add_stage_bar("Size checking", jobs.len() as u64);
+    let pb = reporter.add_stage_bar("Size checking", Some(jobs.len() as u64));
 
     let reporter = reporter.clone();
     let (tx, rx) = mpsc::channel();
@@ -149,6 +149,24 @@ fn spawn_size_check_thread(
     (handle, rx)
 }
 
+/// 段の進捗表示を、アーカイブ 1 つ分の処理を始める状態にする（`path` は表示するパス）
+///
+/// 件数は処理の中で分かってから設定されるので、その前に失敗しても前のアーカイブの完了表示が
+/// 残らないよう、位置・件数（未設定。`Reporter::add_stage_bar` 参照）・ETA の見積もりを戻す。
+fn start_archive(pb: &ProgressBar, path: &Path) {
+    pb.reset();
+    pb.unset_length();
+    pb.set_message(path.display().to_string());
+}
+
+/// 段の進捗表示を完了にする（件数が未設定のまま終わったら、件数を位置に揃えて満杯のバーにする）
+fn finish_stage(pb: &ProgressBar, msg: &'static str) {
+    if pb.length().is_none() {
+        pb.set_length(pb.position());
+    }
+    pb.finish_with_message(msg);
+}
+
 /// アーカイブを一時ディレクトリへ展開する
 fn extract_archive(job: &ArchiveJob, pb: &ProgressBar) -> Result<tempfile::TempDir> {
     let work_dir = tempfile::tempdir().context("failed to create a temporary directory")?;
@@ -160,13 +178,13 @@ fn spawn_extraction_thread(
     size_check_rx: Receiver<ArchiveJob>,
     reporter: &Reporter,
 ) -> (JoinHandle<Result<()>>, Receiver<ProcessingContext>) {
-    let pb = reporter.add_stage_bar("Extracting", 0);
+    let pb = reporter.add_stage_bar("Extracting", None);
 
     let reporter = reporter.clone();
     let (tx, rx) = mpsc::sync_channel(MAX_PENDING_WORK_DIRS);
     let handle = std::thread::spawn(move || {
         for job in size_check_rx {
-            pb.set_message(job.src_file.display().to_string());
+            start_archive(&pb, &job.src_file);
             // 1 ファイルの失敗で全体を止めず、次のファイルへ進む
             let work_dir = match extract_archive(&job, &pb) {
                 Ok(work_dir) => work_dir,
@@ -177,7 +195,7 @@ fn spawn_extraction_thread(
             };
             tx.send(ProcessingContext { work_dir, job })?;
         }
-        pb.finish_with_message("Extracting completed");
+        finish_stage(&pb, "Extracting completed");
         Ok(())
     });
 
@@ -189,13 +207,13 @@ fn spawn_image_resizing_thread(
     extraction_rx: Receiver<ProcessingContext>,
     reporter: &Reporter,
 ) -> (JoinHandle<Result<()>>, Receiver<ProcessingContext>) {
-    let pb = reporter.add_stage_bar("Resizing images", 0);
+    let pb = reporter.add_stage_bar("Resizing images", None);
 
     let reporter = reporter.clone();
     let (tx, rx) = mpsc::sync_channel(MAX_PENDING_WORK_DIRS);
     let handle = std::thread::spawn(move || {
         for ctx in extraction_rx {
-            pb.set_message(ctx.job.src_file.display().to_string());
+            start_archive(&pb, &ctx.job.src_file);
             match resize_image_files(ctx.work_dir.path(), max_height, pb.clone()) {
                 Ok(outcome) => {
                     if !outcome.failed.is_empty() {
@@ -212,7 +230,7 @@ fn spawn_image_resizing_thread(
                 }
             }
         }
-        pb.finish_with_message("Resizing completed");
+        finish_stage(&pb, "Resizing completed");
         Ok(())
     });
 
@@ -257,17 +275,17 @@ fn spawn_zip_creation_thread(
     image_resizing_rx: Receiver<ProcessingContext>,
     reporter: &Reporter,
 ) -> JoinHandle<Result<()>> {
-    let pb = reporter.add_stage_bar("Creating zip", 0);
+    let pb = reporter.add_stage_bar("Creating zip", None);
 
     let reporter = reporter.clone();
     std::thread::spawn(move || {
         for ctx in image_resizing_rx {
-            pb.set_message(ctx.job.dst_file.display().to_string());
+            start_archive(&pb, &ctx.job.dst_file);
             if let Err(e) = create_resized_zip(&ctx, keep_mtime, &pb) {
                 reporter.report_failure("creating", &ctx.job.dst_file, e);
             }
         }
-        pb.finish_with_message("Creating zip completed");
+        finish_stage(&pb, "Creating zip completed");
         Ok(())
     })
 }
@@ -347,6 +365,22 @@ mod tests {
     use clap::Parser;
 
     use crate::test_util::{copy_rar_fixture, list_names, set_mtime, touch_files, write_zip};
+
+    #[test]
+    fn test_start_archive_and_finish_stage() {
+        // 前のアーカイブの完了表示（10/10）を残さず、件数が分かるまでは未設定にする
+        let pb = indicatif::ProgressBar::hidden();
+        pb.set_length(10);
+        pb.set_position(10);
+        super::start_archive(&pb, Path::new("b.zip"));
+        assert_eq!((pb.position(), pb.length()), (0, None));
+        assert_eq!(pb.message(), "b.zip");
+
+        // そのアーカイブが件数の分かる前に失敗して段が終わっても、完了は満杯のバーで示す
+        super::finish_stage(&pb, "done");
+        assert_eq!((pb.position(), pb.length()), (0, Some(0)));
+        assert!(pb.is_finished());
+    }
 
     #[test]
     fn test_args_rejects_zero_max_height() {

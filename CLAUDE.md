@@ -43,7 +43,7 @@ cargo fmt                # フォーマット
 
 ### 4 段のパイプライン（[src/app.rs](src/app.rs)）
 
-`run_pipeline()` が 4 つのワーカースレッドを立ち上げ、`std::sync::mpsc` チャネルで繋いだパイプラインを構成する。各段は自身の `ProgressBar` を持ち、`MultiProgress` で同時表示される。
+`run_pipeline()` が 4 つのワーカースレッドを立ち上げ、`std::sync::mpsc` チャネルで繋いだパイプラインを構成する。各段は自身の `ProgressBar` を持ち、`MultiProgress` で同時表示される。展開・リサイズ・zip 作成の段の進捗はアーカイブごとの件数なので、アーカイブを始めるたびに `start_archive` で戻し、段の完了は `finish_stage` で示す（件数が分かる前に失敗しても、前のアーカイブの完了表示が残らないように）。
 
 1. `spawn_size_check_thread` — 入力アーカイブのファイルサイズ ÷ 内包ファイル数で 1 ファイル平均サイズを求め、**500KB（`MIN_AVERAGE_FILE_SIZE`）超のものだけ**を下流に流す（既に十分小さいアーカイブは処理しない。下限は `run_with` が `run_pipeline` に渡す）。
 2. `spawn_extraction_thread` — `tempfile::TempDir` に展開する（zip / RAR は `ArchiveJob::format` で振り分け）。
