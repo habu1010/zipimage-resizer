@@ -2,12 +2,78 @@
 
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
+    fmt,
     path::{Path, PathBuf},
 };
 
 use crate::archive::ArchiveFormat;
 use crate::fs_util::parent_dir;
-use crate::reporter::Reporter;
+
+/// `plan_jobs` の結果
+#[derive(Debug)]
+pub struct Plan {
+    /// 処理するアーカイブ（指定された順）
+    pub jobs: Vec<ArchiveJob>,
+    /// 処理しない入力とその理由（判定した順。読めない・ファイルでない入力を先に、
+    /// 出力先の検査で除いた入力を後に、それぞれ指定された順で並べる）
+    pub skipped: Vec<Skipped>,
+}
+
+/// 処理しない入力
+#[derive(Debug)]
+pub struct Skipped {
+    /// 指定されたままの入力のパス
+    pub src: PathBuf,
+    pub reason: SkipReason,
+}
+
+/// 入力を処理しない理由
+#[derive(Debug)]
+pub enum SkipReason {
+    /// 入力を開けない・読めない（存在しないなど）
+    Unreadable(std::io::Error),
+    /// 入力がファイルでない（ディレクトリなど）
+    NotAFile,
+    /// 出力先 `dst` のパスを正規化できない（親ディレクトリが無いなど）
+    UnresolvableOutput { dst: PathBuf, error: std::io::Error },
+    /// 出力先 `dst` が入力ファイル（自身でも他の入力でも）と重なる
+    OverwritesInput { dst: PathBuf },
+    /// `-d` に入力元と同じディレクトリを指定し、拡張子を変えた出力先 `dst` が既に存在する
+    OutputExistsInInputDir { dst: PathBuf },
+    /// 出力先 `dst` が、先に指定された入力 `other` の出力先と重なる
+    SameOutputAs { dst: PathBuf, other: PathBuf },
+}
+
+/// ユーザーに表示する報告の文面
+impl fmt::Display for Skipped {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let src = self.src.display();
+        match &self.reason {
+            // 下の UnresolvableOutput と共に、Reporter::report_failure と同じ書式
+            SkipReason::Unreadable(e) => write!(f, "Error reading {src}: {e:#}"),
+            SkipReason::NotAFile => write!(f, "Skipping {src}: not a file"),
+            SkipReason::UnresolvableOutput { dst, error } => {
+                write!(f, "Error resolving {}: {error:#}", dst.display())
+            }
+            SkipReason::OverwritesInput { dst } => write!(
+                f,
+                "Skipping {src}: output {} would overwrite an input file",
+                dst.display()
+            ),
+            SkipReason::OutputExistsInInputDir { dst } => write!(
+                f,
+                "Skipping {src}: output {} already exists in the input directory",
+                dst.display()
+            ),
+            SkipReason::SameOutputAs { dst, other } => write!(
+                f,
+                "Skipping {src}: output {} is also the output of {}",
+                dst.display(),
+                other.display()
+            ),
+        }
+    }
+}
 
 /// 処理するアーカイブ（zip / RAR）とその出力先（zip）の組
 ///
@@ -92,16 +158,12 @@ fn normalize_path(path: &Path) -> std::io::Result<PathBuf> {
 /// - `-d` に入力元と同じディレクトリを指定し、拡張子を変えた出力先（`a.rar` → `a.zip`）が
 ///   既に存在する場合は処理しない（入力に含まれていなくても、同じ本の zip 版の原本かもしれないため）
 ///
-/// 処理しない入力は `Reporter` で報告し、残りの処理は続ける。
+/// 処理しない入力は、理由とともに `Plan::skipped` で返す（報告は呼び出し側で行う）。
 ///
 /// # Errors
 /// 出力先ディレクトリが存在しない・ディレクトリでない場合は、全体をエラーにする
 /// （展開・変換を始める前に失敗させ、最終段で全入力が失敗するのを防ぐ。作成はしない）。
-pub fn plan_jobs(
-    archives: Vec<PathBuf>,
-    output_dir: Option<&Path>,
-    reporter: &Reporter,
-) -> anyhow::Result<Vec<ArchiveJob>> {
+pub fn plan_jobs(archives: Vec<PathBuf>, output_dir: Option<&Path>) -> anyhow::Result<Plan> {
     if let Some(output_dir) = output_dir {
         if !output_dir.exists() {
             anyhow::bail!("output directory not found: {}", output_dir.display());
@@ -111,18 +173,21 @@ pub fn plan_jobs(
         }
     }
 
+    let mut skipped = Vec::new();
+    let mut skip = |src, reason| skipped.push(Skipped { src, reason });
+
     let mut inputs = Vec::new();
     let mut input_paths = HashSet::new();
     for src in archives {
         let canonical = match src.canonicalize() {
             Ok(canonical) => canonical,
             Err(e) => {
-                reporter.report_failure("reading", &src, e);
+                skip(src, SkipReason::Unreadable(e));
                 continue;
             }
         };
         if !canonical.is_file() {
-            reporter.report_error(format!("Skipping {}: not a file", src.display()));
+            skip(src, SkipReason::NotAFile);
             continue;
         }
         if !input_paths.insert(canonical.clone()) {
@@ -130,7 +195,7 @@ pub fn plan_jobs(
         }
         match ArchiveFormat::detect(&canonical) {
             Ok(format) => inputs.push((src, canonical, format)),
-            Err(e) => reporter.report_failure("reading", &src, e),
+            Err(e) => skip(src, SkipReason::Unreadable(e)),
         }
     }
 
@@ -140,37 +205,27 @@ pub fn plan_jobs(
         let dst = determine_output_path(&src, format, output_dir);
         let normalized = match normalize_path(&dst) {
             Ok(normalized) => normalized,
-            Err(e) => {
-                reporter.report_failure("resolving", &dst, e);
+            Err(error) => {
+                skip(src, SkipReason::UnresolvableOutput { dst, error });
                 continue;
             }
         };
 
         if input_paths.contains(&normalized) {
-            reporter.report_error(format!(
-                "Skipping {}: output {} would overwrite an input file",
-                src.display(),
-                dst.display()
-            ));
+            skip(src, SkipReason::OverwritesInput { dst });
             continue;
         }
         // 出力先が入力自身の場合は上で除いているので、ここで見つかるのは拡張子を .zip にした
         // 出力先（入力がシンボリックリンクなら、リンク先と名前が違う場合も含む）
         if output_dir.is_some() && output_exists_in_input_dir(&src, &canonical, &dst) {
-            reporter.report_error(format!(
-                "Skipping {}: output {} already exists in the input directory",
-                src.display(),
-                dst.display()
-            ));
+            skip(src, SkipReason::OutputExistsInInputDir { dst });
             continue;
         }
         match outputs.entry(normalized) {
-            Entry::Occupied(other) => reporter.report_error(format!(
-                "Skipping {}: output {} is also the output of {}",
-                src.display(),
-                dst.display(),
-                other.get().display()
-            )),
+            Entry::Occupied(entry) => {
+                let other = entry.get().clone();
+                skip(src, SkipReason::SameOutputAs { dst, other });
+            }
             Entry::Vacant(entry) => {
                 entry.insert(src.clone());
                 jobs.push(ArchiveJob {
@@ -182,14 +237,14 @@ pub fn plan_jobs(
         }
     }
 
-    Ok(jobs)
+    Ok(Plan { jobs, skipped })
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use crate::reporter::Reporter;
+    use super::{SkipReason, Skipped};
     use crate::test_util::{copy_rar_fixture, touch_files};
 
     #[test]
@@ -248,12 +303,19 @@ mod tests {
         assert_eq!(path, Path::new("/p/test_resized.zip"));
     }
 
-    /// `plan_jobs` を実行し、処理対象の入力とエラー件数を返す
-    fn plan(zipfiles: Vec<PathBuf>, output_dir: Option<PathBuf>) -> (Vec<PathBuf>, usize) {
-        let reporter = Reporter::new();
-        let jobs = super::plan_jobs(zipfiles, output_dir.as_deref(), &reporter).unwrap();
-        let srcs = jobs.into_iter().map(|job| job.src_file).collect();
-        (srcs, reporter.error_count())
+    /// `plan_jobs` を実行し、処理対象の入力と、処理しない入力を返す
+    fn plan(zipfiles: Vec<PathBuf>, output_dir: Option<PathBuf>) -> (Vec<PathBuf>, Vec<Skipped>) {
+        let planned = super::plan_jobs(zipfiles, output_dir.as_deref()).unwrap();
+        let srcs = planned.jobs.into_iter().map(|job| job.src_file).collect();
+        (srcs, planned.skipped)
+    }
+
+    /// 処理しない入力がちょうど 1 つであることを確かめ、その理由を返す
+    fn only_reason(skipped: &[Skipped]) -> &SkipReason {
+        match skipped {
+            [skipped] => &skipped.reason,
+            _ => panic!("expected exactly one skipped input: {skipped:?}"),
+        }
     }
 
     #[test]
@@ -263,11 +325,10 @@ mod tests {
         std::fs::create_dir(&out).unwrap();
         let zipfiles = touch_files(dir.path(), &["a.zip", "b.zip"]);
 
-        let reporter = Reporter::new();
-        let jobs = super::plan_jobs(zipfiles.clone(), Some(&out), &reporter).unwrap();
-        assert_eq!(reporter.error_count(), 0);
+        let planned = super::plan_jobs(zipfiles.clone(), Some(&out)).unwrap();
+        assert!(planned.skipped.is_empty(), "{:?}", planned.skipped);
         assert_eq!(
-            jobs,
+            planned.jobs,
             [
                 super::ArchiveJob {
                     src_file: zipfiles[0].clone(),
@@ -289,9 +350,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let zipfiles = touch_files(dir.path(), &["a.zip"]);
 
-        let (srcs, errors) = plan(zipfiles, Some(dir.path().join(".")));
+        let (srcs, skipped) = plan(zipfiles, Some(dir.path().join(".")));
         assert!(srcs.is_empty());
-        assert_eq!(errors, 1);
+        assert!(matches!(
+            only_reason(&skipped),
+            SkipReason::OverwritesInput { .. }
+        ));
     }
 
     #[test]
@@ -301,9 +365,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let zipfiles = touch_files(dir.path(), &["a.zip", "a_resized.zip", "b.zip"]);
 
-        let (srcs, errors) = plan(zipfiles.clone(), None);
+        let (srcs, skipped) = plan(zipfiles.clone(), None);
         assert_eq!(srcs, &zipfiles[1..]);
-        assert_eq!(errors, 1);
+        assert!(matches!(
+            only_reason(&skipped),
+            SkipReason::OverwritesInput { .. }
+        ));
     }
 
     #[test]
@@ -314,9 +381,12 @@ mod tests {
         std::fs::create_dir(&out).unwrap();
         let zipfiles = touch_files(dir.path(), &["x/a.zip", "y/a.zip"]);
 
-        let (srcs, errors) = plan(zipfiles.clone(), Some(out));
+        let (srcs, skipped) = plan(zipfiles.clone(), Some(out));
         assert_eq!(srcs, &zipfiles[..1]);
-        assert_eq!(errors, 1);
+        assert!(
+            matches!(&skipped[..], [Skipped { src, reason: SkipReason::SameOutputAs { other, .. } }] if *src == zipfiles[1] && *other == zipfiles[0]),
+            "{skipped:?}"
+        );
     }
 
     #[test]
@@ -325,11 +395,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = copy_rar_fixture(dir.path(), "a.cbr");
 
-        let reporter = Reporter::new();
-        let jobs = super::plan_jobs(vec![src.clone()], None, &reporter).unwrap();
-        assert_eq!(reporter.error_count(), 0);
+        let planned = super::plan_jobs(vec![src.clone()], None).unwrap();
+        assert!(planned.skipped.is_empty(), "{:?}", planned.skipped);
         assert_eq!(
-            jobs,
+            planned.jobs,
             [super::ArchiveJob {
                 src_file: src,
                 format: super::ArchiveFormat::Rar,
@@ -347,25 +416,31 @@ mod tests {
         let other = copy_rar_fixture(dir.path(), "b.rar");
         touch_files(dir.path(), &["a.zip"]);
 
-        let (srcs, errors) = plan(
+        let (srcs, skipped) = plan(
             vec![src.clone(), other.clone()],
             Some(dir.path().to_path_buf()),
         );
         assert_eq!(srcs, [other]);
-        assert_eq!(errors, 1);
+        assert!(matches!(
+            only_reason(&skipped),
+            SkipReason::OutputExistsInInputDir { .. }
+        ));
 
         // 中身が zip の c.cbr も出力先が c.zip になるので、同様に上書きしない
         let cbr = touch_files(dir.path(), &["c.cbr", "c.zip"]).remove(0);
-        let (srcs, errors) = plan(vec![cbr], Some(dir.path().to_path_buf()));
+        let (srcs, skipped) = plan(vec![cbr], Some(dir.path().to_path_buf()));
         assert!(srcs.is_empty());
-        assert_eq!(errors, 1);
+        assert!(matches!(
+            only_reason(&skipped),
+            SkipReason::OutputExistsInInputDir { .. }
+        ));
 
         // 別のディレクトリへの出力では、既存の出力は従来どおり上書きする
         let out = dir.path().join("out");
         touch_files(&out, &["a.zip"]);
-        let (srcs, errors) = plan(vec![src], Some(out));
+        let (srcs, skipped) = plan(vec![src], Some(out));
         assert_eq!(srcs.len(), 1);
-        assert_eq!(errors, 0);
+        assert!(skipped.is_empty(), "{skipped:?}");
     }
 
     #[test]
@@ -381,9 +456,12 @@ mod tests {
         let link = books.join("a.rar");
         std::os::unix::fs::symlink(target, &link).unwrap();
 
-        let (srcs, errors) = plan(vec![link], Some(books));
+        let (srcs, skipped) = plan(vec![link], Some(books));
         assert!(srcs.is_empty());
-        assert_eq!(errors, 1);
+        assert!(matches!(
+            only_reason(&skipped),
+            SkipReason::OutputExistsInInputDir { .. }
+        ));
     }
 
     #[test]
@@ -401,9 +479,12 @@ mod tests {
         let link = books.join("a.zip");
         std::os::unix::fs::symlink(target, &link).unwrap();
 
-        let (srcs, errors) = plan(vec![link], Some(real));
+        let (srcs, skipped) = plan(vec![link], Some(real));
         assert!(srcs.is_empty());
-        assert_eq!(errors, 1);
+        assert!(matches!(
+            only_reason(&skipped),
+            SkipReason::OutputExistsInInputDir { .. }
+        ));
     }
 
     #[test]
@@ -417,9 +498,12 @@ mod tests {
         let src = copy_rar_fixture(&books, "a.rar");
         std::os::unix::fs::symlink(target, books.join("a.zip")).unwrap();
 
-        let (srcs, errors) = plan(vec![src], Some(books));
+        let (srcs, skipped) = plan(vec![src], Some(books));
         assert!(srcs.is_empty());
-        assert_eq!(errors, 1);
+        assert!(matches!(
+            only_reason(&skipped),
+            SkipReason::OutputExistsInInputDir { .. }
+        ));
     }
 
     #[test]
@@ -429,9 +513,12 @@ mod tests {
         let zip = touch_files(dir.path(), &["a.zip"]).remove(0);
         let rar = copy_rar_fixture(dir.path(), "a.rar");
 
-        let (srcs, errors) = plan(vec![zip.clone(), rar], None);
-        assert_eq!(srcs, [zip]);
-        assert_eq!(errors, 1);
+        let (srcs, skipped) = plan(vec![zip.clone(), rar.clone()], None);
+        assert_eq!(srcs, std::slice::from_ref(&zip));
+        assert!(
+            matches!(&skipped[..], [Skipped { src, reason: SkipReason::SameOutputAs { other, .. } }] if *src == rar && *other == zip),
+            "{skipped:?}"
+        );
     }
 
     #[test]
@@ -441,14 +528,14 @@ mod tests {
         let zipfiles = touch_files(dir.path(), &["a.zip"]);
         let duplicate = dir.path().join(".").join("a.zip");
 
-        let (srcs, errors) = plan(vec![zipfiles[0].clone(), duplicate], None);
+        let (srcs, skipped) = plan(vec![zipfiles[0].clone(), duplicate], None);
         assert_eq!(srcs, zipfiles);
-        assert_eq!(errors, 0);
+        assert!(skipped.is_empty(), "{skipped:?}");
     }
 
     #[test]
     fn test_plan_jobs_invalid_input() {
-        // 存在しない入力やディレクトリは報告して除く（panic しない）
+        // 存在しない入力やディレクトリは理由とともに除く（panic しない）
         let dir = tempfile::tempdir().unwrap();
         let zipfiles = vec![
             dir.path().join("missing.zip"),
@@ -456,9 +543,20 @@ mod tests {
             PathBuf::from("/"),
         ];
 
-        let (srcs, errors) = plan(zipfiles, None);
+        let (srcs, skipped) = plan(zipfiles, None);
         assert!(srcs.is_empty());
-        assert_eq!(errors, 3);
+        let reasons: Vec<_> = skipped.iter().map(|skipped| &skipped.reason).collect();
+        assert!(
+            matches!(
+                reasons[..],
+                [
+                    SkipReason::Unreadable(_),
+                    SkipReason::NotAFile,
+                    SkipReason::NotAFile
+                ]
+            ),
+            "{skipped:?}"
+        );
     }
 
     #[test]
@@ -467,10 +565,50 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let zipfiles = touch_files(dir.path(), &["a.zip"]);
         for output_dir in [dir.path().join("missing"), zipfiles[0].clone()] {
-            let reporter = Reporter::new();
-            let result = super::plan_jobs(zipfiles.clone(), Some(&output_dir), &reporter);
+            let result = super::plan_jobs(zipfiles.clone(), Some(&output_dir));
             assert!(result.is_err(), "{}", output_dir.display());
-            assert_eq!(reporter.error_count(), 0);
+        }
+    }
+
+    #[test]
+    fn test_skipped_display() {
+        // ユーザーに表示する報告の文面
+        let skipped = |reason| super::Skipped {
+            src: PathBuf::from("a.rar"),
+            reason,
+        };
+        let dst = || PathBuf::from("out/a.zip");
+        let io_error = || std::io::Error::other("boom");
+        for (reason, expected) in [
+            (
+                SkipReason::Unreadable(io_error()),
+                "Error reading a.rar: boom",
+            ),
+            (SkipReason::NotAFile, "Skipping a.rar: not a file"),
+            (
+                SkipReason::UnresolvableOutput {
+                    dst: dst(),
+                    error: io_error(),
+                },
+                "Error resolving out/a.zip: boom",
+            ),
+            (
+                SkipReason::OverwritesInput { dst: dst() },
+                "Skipping a.rar: output out/a.zip would overwrite an input file",
+            ),
+            (
+                SkipReason::OutputExistsInInputDir { dst: dst() },
+                "Skipping a.rar: output out/a.zip already exists in the input directory",
+            ),
+            (
+                SkipReason::SameOutputAs {
+                    dst: dst(),
+                    other: PathBuf::from("a.zip"),
+                },
+                "Skipping a.rar: output out/a.zip is also the output of a.zip",
+            ),
+        ] {
+            assert_eq!(skipped(reason).to_string(), expected);
         }
     }
 }

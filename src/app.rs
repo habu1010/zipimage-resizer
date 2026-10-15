@@ -303,10 +303,14 @@ fn run_with(args: Args) -> Result<()> {
         archives,
     } = args;
 
+    let plan = plan_jobs(archives, output_dir.as_deref())?;
     let reporter = Reporter::new();
-    let jobs = plan_jobs(archives, output_dir.as_deref(), &reporter)?;
+    // 処理しない入力も失敗として数える（終了コードに反映する）
+    for skipped in &plan.skipped {
+        reporter.report_error(skipped.to_string());
+    }
     run_pipeline(
-        jobs,
+        plan.jobs,
         MIN_AVERAGE_FILE_SIZE,
         max_height,
         keep_mtime,
@@ -592,9 +596,10 @@ mod tests {
         // サイズの下限を 0 にしてパイプラインに流す
         let dir = tempfile::tempdir().unwrap();
         let src = copy_rar_fixture(dir.path(), "book.rar");
+        let plan = super::plan_jobs(vec![src], None).unwrap();
+        assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
         let reporter = super::Reporter::new();
-        let jobs = super::plan_jobs(vec![src], None, &reporter).unwrap();
-        super::run_pipeline(jobs, 0, 1800, false, &reporter).unwrap();
+        super::run_pipeline(plan.jobs, 0, 1800, false, &reporter).unwrap();
         assert_eq!(reporter.error_count(), 0);
 
         assert_eq!(list_names(dir.path()), ["book.rar", "book_resized.zip"]);
@@ -604,6 +609,16 @@ mod tests {
             archive.file_names().collect::<Vec<_>>(),
             ["001.webp", "日本語.txt", "sub/", "sub/002.txt"]
         );
+    }
+
+    #[test]
+    fn test_run_reports_skipped_inputs() {
+        // 存在しない入力やディレクトリは、処理しない入力として報告し、終了コードに反映する
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.zip");
+
+        let err = run_cli(&[missing.to_str().unwrap(), dir.path().to_str().unwrap()]).unwrap_err();
+        assert_eq!(err.to_string(), "2 file(s) had errors");
     }
 
     #[test]
