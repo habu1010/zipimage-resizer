@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use indicatif::{ParallelProgressIterator, ProgressBar};
 use rayon::prelude::*;
 
-use crate::fs_util::parent_dir;
+use crate::fs_util::{parent_dir, scan_regular_files, walk_error_in};
 use crate::image_util::{self, ReduceSize, ToWebPMemory};
 use crate::webp_names::rename_to_final_names;
 
@@ -105,18 +105,24 @@ pub struct ResizeOutcome {
     pub failed: Vec<(PathBuf, anyhow::Error)>,
 }
 
-/// `files` を WebP に変換する
+/// `base_dir`（アーカイブの展開先）以下の画像を WebP に変換する
 ///
 /// 個々の画像の変換に失敗しても、その画像は元のまま残して `failed` に記録し、
 /// 残りの画像の変換を続ける（1 枚のために zip 全体を諦めない）。
 ///
-/// `base_dir` は `files` を展開したディレクトリで、エラーに zip 内のパスを示すのに使う。
+/// 走査に失敗した場合は、何も変更せずに `Err` を返す。最終名への rename に失敗した場合の
+/// `Err` では、`base_dir` の中身は途中の状態（元画像を消した後の一時ファイルが残っている
+/// など）なので、出力に使ってはならない。
 pub fn resize_image_files(
-    files: &[PathBuf],
     base_dir: &Path,
     max_height: u32,
     pb: ProgressBar,
 ) -> Result<ResizeOutcome> {
+    let files: Vec<PathBuf> = scan_regular_files(base_dir)
+        .collect::<walkdir::Result<_>>()
+        .map_err(|e| walk_error_in(e, base_dir))
+        .context("failed to scan the extracted files")?;
+
     pb.set_position(0);
     pb.set_length(files.len() as u64);
 
@@ -149,7 +155,7 @@ pub fn resize_image_files(
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use crate::test_util::{list_names, write_animated_gif, write_image};
 
@@ -179,10 +185,7 @@ mod tests {
 
     /// `dir` 内の全ファイルを変換する
     fn resize_dir(dir: &Path) -> super::ResizeOutcome {
-        let files: Vec<PathBuf> = crate::fs_util::scan_regular_files(dir)
-            .collect::<std::io::Result<_>>()
-            .unwrap();
-        super::resize_image_files(&files, dir, 1800, indicatif::ProgressBar::hidden()).unwrap()
+        super::resize_image_files(dir, 1800, indicatif::ProgressBar::hidden()).unwrap()
     }
 
     #[test]
@@ -264,5 +267,27 @@ mod tests {
         let (resized, names) = resize_files_in_tempdir(&["001.webp/", "001.png"]);
         assert_eq!(resized, 1);
         assert_eq!(names, ["001.png.webp", "001.webp"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_resize_image_files_reports_scan_error() {
+        // 読めないディレクトリがあれば、その中の画像を黙って変換し損ねずにエラーにする。
+        // 走査の失敗は変換を始める前に起きるので、読める画像も変換しない
+        let dir = tempfile::tempdir().unwrap();
+        write_image(&dir.path().join("001.png"));
+        let Some(_restore) = crate::test_util::unreadable_subdir(dir.path()) else {
+            return;
+        };
+        let result = super::resize_image_files(dir.path(), 1800, indicatif::ProgressBar::hidden());
+        let Err(err) = result else {
+            panic!("expected an error");
+        };
+        assert!(
+            format!("{err:#}")
+                .starts_with("failed to scan the extracted files: failed to read sub: "),
+            "{err:#}"
+        );
+        assert_eq!(list_names(dir.path()), ["001.png", "sub"]);
     }
 }

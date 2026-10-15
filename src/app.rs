@@ -11,7 +11,7 @@ use indicatif::ProgressBar;
 
 use crate::archive::{self, ArchiveFormat};
 use crate::convert::{resize_image_files, ResizeOutcome};
-use crate::fs_util::{self, parent_dir};
+use crate::fs_util::parent_dir;
 use crate::plan::{plan_jobs, ArchiveJob};
 use crate::reporter::Reporter;
 use crate::zip_util;
@@ -195,14 +195,7 @@ fn spawn_image_resizing_thread(
     let handle = std::thread::spawn(move || {
         for ctx in extraction_rx {
             pb.set_message(ctx.job.src_file.to_string_lossy().into_owned());
-            let files: Vec<_> = match fs_util::scan_regular_files(ctx.work_dir.path()).collect() {
-                Ok(files) => files,
-                Err(e) => {
-                    reporter.report_failure("scanning", &ctx.job.src_file, e);
-                    continue;
-                }
-            };
-            match resize_image_files(&files, ctx.work_dir.path(), max_height, pb.clone()) {
+            match resize_image_files(ctx.work_dir.path(), max_height, pb.clone()) {
                 Ok(outcome) => {
                     if !outcome.failed.is_empty() {
                         reporter.report_error(format_conversion_failures(&ctx, &outcome));
