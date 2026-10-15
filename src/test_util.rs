@@ -96,3 +96,10 @@ pub fn touch_files(dir: &Path, files: &[&str]) -> Vec<std::path::PathBuf> {
         })
         .collect()
 }
+
+/// `testdata` にあるテスト用ファイルのパスを返す
+pub fn fixture(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata")
+        .join(name)
+}

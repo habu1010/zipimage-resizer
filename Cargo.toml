@@ -12,11 +12,13 @@ strip = true
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+crc32fast = "1"
 image = "0"
 indicatif = { version = "0", features = ["rayon"] }
 rayon = "1"
 ripunzip = "2"
 tempfile = "3"
+unrar = "0.5"
 walkdir = "2"
 webp = "0"
 zip = "2"
