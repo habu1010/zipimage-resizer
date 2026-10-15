@@ -55,7 +55,7 @@ fn catch_panic<T>(f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
 /// # Errors
 /// RAR が存在しない・壊れている場合と、対応していない RAR（分割 RAR、途中で切れた RAR5）の
 /// 場合にエラーを返す
-pub fn get_file_count(rar_file: &Path) -> anyhow::Result<usize> {
+pub fn file_count(rar_file: &Path) -> anyhow::Result<usize> {
     catch_panic(|| validated_entry_count(rar_file))
 }
 
@@ -144,7 +144,7 @@ fn has_end_header(tail: &[u8]) -> bool {
 
 /// アーカイブ内のパスを、展開先 `output_dir` の下のパスにする
 ///
-/// 中身は自前で書き出すので（`unrar_with_progress` 参照）、UnRAR によるパスの正規化は効かない。
+/// 中身は自前で書き出すので（`extract` 参照）、UnRAR によるパスの正規化は効かない。
 /// `..` や絶対パスで展開先の外に書き出さないよう、ここで弾く。
 fn entry_dest_path(output_dir: &Path, name: &Path) -> anyhow::Result<PathBuf> {
     let is_safe = name.components().all(|c| match c {
@@ -169,11 +169,7 @@ fn entry_dest_path(output_dir: &Path, name: &Path) -> anyhow::Result<PathBuf> {
 ///
 /// ファイル参照・リンク（RAR4 のシンボリックリンクも含む）は、UnRAR が中身を展開せず空で返すので、
 /// 元のサイズがあるのに空ならエラーにする。
-pub fn unrar_with_progress(
-    rar_file: &Path,
-    output_dir: &Path,
-    pb: &ProgressBar,
-) -> anyhow::Result<()> {
+pub fn extract(rar_file: &Path, output_dir: &Path, pb: &ProgressBar) -> anyhow::Result<()> {
     catch_panic(|| extract_entries(rar_file, output_dir, pb))
 }
 
@@ -221,17 +217,17 @@ mod tests {
     use crate::test_util::fixture;
 
     #[test]
-    fn test_get_file_count() {
+    fn test_file_count() {
         // 001.png, sub/, sub/002.txt, 日本語.txt
-        assert_eq!(super::get_file_count(&fixture("basic.rar")).unwrap(), 4);
+        assert_eq!(super::file_count(&fixture("basic.rar")).unwrap(), 4);
     }
 
     #[test]
-    fn test_unrar_with_progress() {
+    fn test_extract() {
         for name in ["basic.rar", "solid.rar"] {
             let dir = tempfile::tempdir().unwrap();
             let pb = ProgressBar::hidden();
-            super::unrar_with_progress(&fixture(name), dir.path(), &pb).unwrap();
+            super::extract(&fixture(name), dir.path(), &pb).unwrap();
 
             assert_eq!(pb.position(), 4, "{name}");
             assert_eq!(
@@ -254,15 +250,14 @@ mod tests {
     #[test]
     fn test_multi_volume_is_rejected() {
         for name in ["multi.part1.rar", "multi.part2.rar"] {
-            let err = super::get_file_count(&fixture(name)).unwrap_err();
+            let err = super::file_count(&fixture(name)).unwrap_err();
             assert_eq!(
                 err.to_string(),
                 "multi-volume RAR archives are not supported"
             );
 
             let dir = tempfile::tempdir().unwrap();
-            let result =
-                super::unrar_with_progress(&fixture(name), dir.path(), &ProgressBar::hidden());
+            let result = super::extract(&fixture(name), dir.path(), &ProgressBar::hidden());
             assert!(result.is_err(), "{name}");
         }
     }
@@ -270,7 +265,7 @@ mod tests {
     #[test]
     fn test_encrypted_is_error() {
         let dir = tempfile::tempdir().unwrap();
-        let result = super::unrar_with_progress(
+        let result = super::extract(
             &fixture("encrypted.rar"),
             dir.path(),
             &ProgressBar::hidden(),
@@ -278,7 +273,7 @@ mod tests {
         assert!(result.is_err());
 
         // ヘッダまで暗号化したものは、件数取得（サイズチェック段）の時点でエラーになる
-        assert!(super::get_file_count(&fixture("encrypted_headers.rar")).is_err());
+        assert!(super::file_count(&fixture("encrypted_headers.rar")).is_err());
     }
 
     #[test]
@@ -289,9 +284,9 @@ mod tests {
         let path = dir.path().join("truncated.rar");
         for len in [60, 150, 200, 245, data.len() - 1] {
             std::fs::write(&path, &data[..len]).unwrap();
-            assert!(super::get_file_count(&path).is_err(), "{len}");
+            assert!(super::file_count(&path).is_err(), "{len}");
             let out = tempfile::tempdir().unwrap();
-            let result = super::unrar_with_progress(&path, out.path(), &ProgressBar::hidden());
+            let result = super::extract(&path, out.path(), &ProgressBar::hidden());
             assert!(result.is_err(), "{len}");
         }
     }
@@ -315,7 +310,7 @@ mod tests {
     fn test_not_a_rar_is_error() {
         let dir = tempfile::tempdir().unwrap();
         let file = crate::test_util::touch_files(dir.path(), &["empty.rar"]).remove(0);
-        assert!(super::get_file_count(&file).is_err());
+        assert!(super::file_count(&file).is_err());
     }
 
     #[test]
@@ -351,8 +346,7 @@ mod tests {
         for name in ["file_ref.rar", "hard_link.rar", "symlink.rar"] {
             let dir = tempfile::tempdir().unwrap();
             let err =
-                super::unrar_with_progress(&fixture(name), dir.path(), &ProgressBar::hidden())
-                    .unwrap_err();
+                super::extract(&fixture(name), dir.path(), &ProgressBar::hidden()).unwrap_err();
             assert!(
                 err.to_string()
                     .starts_with("unsupported entry (file reference or link): "),

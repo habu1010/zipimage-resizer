@@ -87,7 +87,7 @@ cargo fmt                # フォーマット
 
 ### zip 入出力（[src/zip_util.rs](src/zip_util.rs)）
 
-- 展開は `ripunzip` の `UnzipEngine`。進捗表示付きの `unzip_with_progress` は `single_threaded: true`（進捗カウントの整合性のため）。
+- 展開は `ripunzip` の `UnzipEngine`。展開（`zip_util::extract`）は `single_threaded: true`（進捗カウントの整合性のため）。
 - 圧縮は `zip` クレート。画像系拡張子（jpg/jpeg/png/webp）は `CompressionMethod::Stored`（無圧縮）にし、それ以外はデフォルト圧縮。既圧縮の画像を再圧縮しないための最適化。
 - `add_dir_to_zip` は walkdir の 1 回の走査で全エントリを集め（件数は進捗表示に使う）、各ディレクトリで「ファイル（名前順）→ サブディレクトリ（名前順）」の深さ優先の順で格納する。パスは基準ディレクトリからの相対パス。
 - ディレクトリ走査（`add_dir_to_zip` と `fs_util::scan_regular_files`）のエラーは無視せず返す。無視すると、読めなかったファイルが黙って出力 zip から抜け落ちるため。

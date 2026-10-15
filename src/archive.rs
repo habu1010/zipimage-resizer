@@ -38,26 +38,21 @@ impl ArchiveFormat {
             },
         )
     }
-}
 
-/// アーカイブに含まれるエントリ数を取得する
-pub fn get_file_count(path: &Path, format: ArchiveFormat) -> anyhow::Result<usize> {
-    match format {
-        ArchiveFormat::Zip => zip_util::get_file_count(path),
-        ArchiveFormat::Rar => rar_util::get_file_count(path),
+    /// アーカイブに含まれるエントリ数（ディレクトリを含む）を取得する
+    pub fn file_count(self, path: &Path) -> anyhow::Result<usize> {
+        match self {
+            Self::Zip => zip_util::file_count(path),
+            Self::Rar => rar_util::file_count(path),
+        }
     }
-}
 
-/// アーカイブを `output_dir` に展開する
-pub fn extract_with_progress(
-    path: &Path,
-    output_dir: &Path,
-    format: ArchiveFormat,
-    pb: &ProgressBar,
-) -> anyhow::Result<()> {
-    match format {
-        ArchiveFormat::Zip => zip_util::unzip_with_progress(path, output_dir, pb),
-        ArchiveFormat::Rar => rar_util::unrar_with_progress(path, output_dir, pb),
+    /// アーカイブを `output_dir` に展開し、展開したエントリ数を `pb` に進捗として示す
+    pub fn extract(self, path: &Path, output_dir: &Path, pb: &ProgressBar) -> anyhow::Result<()> {
+        match self {
+            Self::Zip => zip_util::extract(path, output_dir, pb),
+            Self::Rar => rar_util::extract(path, output_dir, pb),
+        }
     }
 }
 

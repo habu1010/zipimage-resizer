@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use indicatif::ProgressBar;
 
-use crate::archive::{self, ArchiveFormat};
+use crate::archive::ArchiveFormat;
 use crate::convert::{resize_image_files, ResizeOutcome};
 use crate::fs_util::parent_dir;
 use crate::plan::{plan_jobs, ArchiveJob};
@@ -105,7 +105,7 @@ fn format_conversion_failures(src_file: &Path, outcome: &ResizeOutcome) -> Strin
 
 fn calc_average_size_per_file(path: &Path, format: ArchiveFormat) -> Result<u64> {
     let file_size = path.metadata()?.len();
-    let file_count = archive::get_file_count(path, format)? as u64;
+    let file_count = format.file_count(path)? as u64;
     // 空のアーカイブは処理対象外とする（ゼロ除算の回避）
     if file_count == 0 {
         return Ok(0);
@@ -151,7 +151,7 @@ fn spawn_size_check_thread(
 /// アーカイブを一時ディレクトリへ展開する
 fn extract_archive(job: &ArchiveJob, pb: &ProgressBar) -> Result<tempfile::TempDir> {
     let work_dir = tempfile::tempdir().context("failed to create a temporary directory")?;
-    archive::extract_with_progress(&job.src_file, work_dir.path(), job.format, pb)?;
+    job.format.extract(&job.src_file, work_dir.path(), pb)?;
     Ok(work_dir)
 }
 

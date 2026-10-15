@@ -18,7 +18,7 @@ impl UnzipProgressReporter for UnzipProgressBar {
 ///
 /// # Errors
 /// zip が存在しない・壊れている場合にエラーを返す
-pub fn get_file_count(zip_file: &Path) -> anyhow::Result<usize> {
+pub fn file_count(zip_file: &Path) -> anyhow::Result<usize> {
     let file = File::open(zip_file)?;
     let archive = zip::ZipArchive::new(file)?;
 
@@ -26,13 +26,9 @@ pub fn get_file_count(zip_file: &Path) -> anyhow::Result<usize> {
 }
 
 /// zip を `output_dir` に展開し、展開したエントリ数を `pb` に進捗として示す
-pub fn unzip_with_progress(
-    zip_file: &Path,
-    output_dir: &Path,
-    pb: &ProgressBar,
-) -> anyhow::Result<()> {
+pub fn extract(zip_file: &Path, output_dir: &Path, pb: &ProgressBar) -> anyhow::Result<()> {
     pb.set_position(0);
-    pb.set_length(get_file_count(zip_file)? as u64);
+    pb.set_length(file_count(zip_file)? as u64);
 
     let file = File::open(zip_file)?;
     let engine = UnzipEngine::for_file(file)?;
