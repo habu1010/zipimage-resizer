@@ -124,6 +124,34 @@ mod tests {
     use indicatif::ProgressBar;
 
     #[test]
+    fn test_file_count_and_extract() {
+        use crate::test_util::{list_names, write_zip};
+
+        // 件数と進捗にはディレクトリのエントリも含まれ、サブディレクトリの中身も展開される
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("a.zip");
+        write_zip(
+            &zip,
+            &[
+                ("a.txt", b"text".to_vec()),
+                ("sub/", Vec::new()),
+                ("sub/b.txt", b"text".to_vec()),
+            ],
+        );
+        assert_eq!(super::file_count(&zip).unwrap(), 3);
+
+        let out = tempfile::tempdir().unwrap();
+        let pb = ProgressBar::hidden();
+        super::extract(&zip, out.path(), &pb).unwrap();
+        assert_eq!(pb.position(), 3);
+        assert_eq!(list_names(out.path()), ["a.txt", "sub"]);
+        assert_eq!(
+            std::fs::read(out.path().join("sub/b.txt")).unwrap(),
+            b"text"
+        );
+    }
+
+    #[test]
     fn test_zip_with_progress() {
         // 作成した zip を読み戻し、エントリの順序・中身・圧縮方式を確認する
         let dir = tempfile::tempdir().unwrap();

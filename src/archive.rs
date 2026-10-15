@@ -82,4 +82,26 @@ mod tests {
         }
         assert!(ArchiveFormat::detect(&dir.path().join("missing.rar")).is_err());
     }
+
+    #[test]
+    fn test_file_count_and_extract() {
+        use crate::test_util::{fixture, write_zip};
+
+        // 形式ごとに、件数の取得と展開がそれぞれの実装に振り分けられる
+        // （展開の中身は zip_util・rar_util のテストで確かめる）
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("a.zip");
+        write_zip(&zip, &[("a.txt", b"text".to_vec())]);
+
+        for (format, path, count) in [
+            (ArchiveFormat::Zip, zip, 1),
+            (ArchiveFormat::Rar, fixture("basic.rar"), 4),
+        ] {
+            assert_eq!(format.file_count(&path).unwrap(), count, "{format:?}");
+            let out = tempfile::tempdir().unwrap();
+            let pb = indicatif::ProgressBar::hidden();
+            format.extract(&path, out.path(), &pb).unwrap();
+            assert_eq!(pb.position(), count as u64, "{format:?}");
+        }
+    }
 }

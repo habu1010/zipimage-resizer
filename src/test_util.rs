@@ -110,3 +110,22 @@ pub fn copy_rar_fixture(dir: &Path, dest_name: &str) -> std::path::PathBuf {
     std::fs::copy(fixture("basic.rar"), &path).unwrap();
     path
 }
+
+/// `entries`（zip 内のパスと中身）を格納した zip を作る（`/` で終わるパスはディレクトリ）
+pub fn write_zip(path: &Path, entries: &[(&str, Vec<u8>)]) {
+    use std::io::Write;
+
+    let mut zw = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, data) in entries {
+        if name.ends_with('/') {
+            assert!(data.is_empty(), "directory entry with data: {name}");
+            zw.add_directory(*name, options).unwrap();
+        } else {
+            zw.start_file(*name, options).unwrap();
+            zw.write_all(data).unwrap();
+        }
+    }
+    zw.finish().unwrap();
+}

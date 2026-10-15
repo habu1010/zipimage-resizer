@@ -353,7 +353,7 @@ mod tests {
 
     use clap::Parser;
 
-    use crate::test_util::{copy_rar_fixture, list_names, touch_files};
+    use crate::test_util::{copy_rar_fixture, list_names, touch_files, write_zip};
 
     #[test]
     fn test_args_rejects_zero_max_height() {
@@ -494,20 +494,6 @@ mod tests {
             };
             image::Rgb([next(), next(), next()])
         })
-    }
-
-    /// `entries`（zip 内のパスと中身）を格納した zip を作る
-    fn write_zip(path: &Path, entries: &[(&str, Vec<u8>)]) {
-        use std::io::Write;
-
-        let mut zw = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
-        for (name, data) in entries {
-            zw.start_file(*name, options).unwrap();
-            zw.write_all(data).unwrap();
-        }
-        zw.finish().unwrap();
     }
 
     /// 画像をエンコードしたバイト列にする
