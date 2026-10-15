@@ -92,7 +92,7 @@ impl ToWebPMemory for image::DynamicImage {
         };
 
         let encoder = webp::Encoder::from_image(&image)
-            .map_err(|e| anyhow::anyhow!("Failed to create WebP encoder: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("failed to create the WebP encoder: {e}"))?;
 
         // 品質を高い順に試し、`max_size` 以下に収まった最初の結果を採用する
         const QUALITIES: [f32; 9] = [95.0, 85.0, 75.0, 65.0, 55.0, 45.0, 35.0, 25.0, 15.0];
