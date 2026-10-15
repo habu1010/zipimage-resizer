@@ -29,7 +29,9 @@ cargo fmt                # フォーマット
 
 ### モジュール構成
 
-- [src/app.rs](src/app.rs) — CLI 引数、入力の検証（`plan_jobs`）、4 段のパイプラインの組み立てとエラー報告
+- [src/app.rs](src/app.rs) — CLI 引数、4 段のパイプラインの組み立て（各段の処理と、終了時のエラー件数の判定を含む）
+- [src/plan.rs](src/plan.rs) — 出力先ディレクトリを検証し、各入力の形式と出力先を決め、上書きや出力先の重複を検証する（`plan_jobs` / `determine_output_path`）
+- [src/reporter.rs](src/reporter.rs) — 進捗表示とエラー報告（`Reporter`）
 - [src/convert.rs](src/convert.rs) — 展開済みの画像を WebP に変換する（`resize_image_files` / `resize_image_file_webp`）
 - [src/webp_names.rs](src/webp_names.rs) — 変換後の WebP の出力名を衝突しないように決める（`rename_to_final_names`）
 - [src/image_util.rs](src/image_util.rs) — 画像単体の処理（デコード・縮小・WebP エンコード・アニメーション判定）

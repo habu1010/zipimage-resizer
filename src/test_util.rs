@@ -103,3 +103,10 @@ pub fn fixture(name: &str) -> std::path::PathBuf {
         .join("testdata")
         .join(name)
 }
+
+/// `testdata/basic.rar` を `dir` に `dest_name` という名前でコピーし、そのパスを返す
+pub fn copy_rar_fixture(dir: &Path, dest_name: &str) -> std::path::PathBuf {
+    let path = dir.join(dest_name);
+    std::fs::copy(fixture("basic.rar"), &path).unwrap();
+    path
+}
