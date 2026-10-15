@@ -112,8 +112,10 @@ fn calc_average_size_per_file(path: &Path, format: ArchiveFormat) -> Result<u64>
     Ok(file_size / file_count)
 }
 
+/// 1 ファイルあたりの平均サイズが `min_average_file_size` を超えるアーカイブだけを下流に流す
 fn spawn_size_check_thread(
     jobs: Vec<ArchiveJob>,
+    min_average_file_size: u64,
     reporter: &Reporter,
 ) -> (JoinHandle<Result<()>>, Receiver<ArchiveJob>) {
     let pb = reporter.add_stage_bar("Size checking", jobs.len() as u64);
@@ -127,7 +129,7 @@ fn spawn_size_check_thread(
             let src_file = &job.src_file;
             pb.set_message(src_file.display().to_string());
             match calc_average_size_per_file(src_file, job.format) {
-                Ok(size_per_file) if size_per_file > MIN_AVERAGE_FILE_SIZE => {
+                Ok(size_per_file) if size_per_file > min_average_file_size => {
                     to_convert += 1;
                     tx.send(job)?;
                 }
@@ -285,12 +287,40 @@ fn run_with(args: Args) -> Result<()> {
 
     let reporter = Reporter::new();
     let jobs = plan_jobs(archives, output_dir.as_deref(), &reporter)?;
+    run_pipeline(
+        jobs,
+        MIN_AVERAGE_FILE_SIZE,
+        max_height,
+        keep_mtime,
+        &reporter,
+    )?;
 
-    let (size_check_handle, size_check_rx) = spawn_size_check_thread(jobs, &reporter);
-    let (extraction_handle, extraction_rx) = spawn_extraction_thread(size_check_rx, &reporter);
+    // 個々のファイルの失敗は処理を止めないが、終了コードには反映する
+    let error_count = reporter.error_count();
+    if error_count > 0 {
+        anyhow::bail!("{error_count} file(s) had errors");
+    }
+
+    Ok(())
+}
+
+/// `jobs` を 4 段のパイプライン（サイズチェック → 展開 → リサイズ → zip 作成）で処理する
+///
+/// 個々のファイルの失敗は `reporter` に報告して続ける。エラーを返すのは、下流が消えて
+/// スレッドが途中で終わった場合だけ（スレッドの panic はそのまま panic として伝わる）。
+fn run_pipeline(
+    jobs: Vec<ArchiveJob>,
+    min_average_file_size: u64,
+    max_height: u32,
+    keep_mtime: bool,
+    reporter: &Reporter,
+) -> Result<()> {
+    let (size_check_handle, size_check_rx) =
+        spawn_size_check_thread(jobs, min_average_file_size, reporter);
+    let (extraction_handle, extraction_rx) = spawn_extraction_thread(size_check_rx, reporter);
     let (image_resizing_handle, image_resizing_rx) =
-        spawn_image_resizing_thread(max_height, extraction_rx, &reporter);
-    let zip_creation_handle = spawn_zip_creation_thread(keep_mtime, image_resizing_rx, &reporter);
+        spawn_image_resizing_thread(max_height, extraction_rx, reporter);
+    let zip_creation_handle = spawn_zip_creation_thread(keep_mtime, image_resizing_rx, reporter);
 
     // 途中で return すると残りのスレッドが強制終了され、
     // 書きかけの zip が残るため、まず全スレッドの終了を待つ
@@ -305,12 +335,6 @@ fn run_with(args: Args) -> Result<()> {
     // そのため下流から順にエラーを探す
     for result in results.into_iter().rev() {
         result.unwrap()?;
-    }
-
-    // 個々のファイルの失敗は処理を止めないが、終了コードには反映する
-    let error_count = reporter.error_count();
-    if error_count > 0 {
-        anyhow::bail!("{error_count} file(s) had errors");
     }
 
     Ok(())
@@ -531,23 +555,12 @@ mod tests {
     #[test]
     fn test_pipeline_converts_rar() {
         // 処理対象になる（平均 500KB 超の）RAR はフィクスチャとして大きすぎるので、
-        // サイズチェックの後段（展開 → リサイズ → zip 作成）に直接流す
+        // サイズの下限を 0 にしてパイプラインに流す
         let dir = tempfile::tempdir().unwrap();
         let src = copy_rar_fixture(dir.path(), "book.rar");
         let reporter = super::Reporter::new();
         let jobs = super::plan_jobs(vec![src], None, &reporter).unwrap();
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        for job in jobs {
-            tx.send(job).unwrap();
-        }
-        drop(tx);
-        let (extraction, rx) = super::spawn_extraction_thread(rx, &reporter);
-        let (resizing, rx) = super::spawn_image_resizing_thread(1800, rx, &reporter);
-        let creation = super::spawn_zip_creation_thread(false, rx, &reporter);
-        for handle in [extraction, resizing, creation] {
-            handle.join().unwrap().unwrap();
-        }
+        super::run_pipeline(jobs, 0, 1800, false, &reporter).unwrap();
         assert_eq!(reporter.error_count(), 0);
 
         assert_eq!(list_names(dir.path()), ["book.rar", "book_resized.zip"]);
