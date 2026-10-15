@@ -94,13 +94,14 @@ impl ToWebPMemory for image::DynamicImage {
         let encoder = webp::Encoder::from_image(&image)
             .map_err(|e| anyhow::anyhow!("Failed to create WebP encoder: {e}"))?;
 
-        let webp = (15i16..=95)
-            .rev()
-            .step_by(10)
-            .map(f32::from)
+        // 品質を高い順に試し、`max_size` 以下に収まった最初の結果を採用する
+        const QUALITIES: [f32; 9] = [95.0, 85.0, 75.0, 65.0, 55.0, 45.0, 35.0, 25.0, 15.0];
+        const FALLBACK_QUALITY: f32 = 10.0;
+        let webp = QUALITIES
+            .into_iter()
             .map(|quality| encoder.encode(quality))
             .find(|webp| webp.len() <= max_size)
-            .unwrap_or_else(|| encoder.encode(10.0));
+            .unwrap_or_else(|| encoder.encode(FALLBACK_QUALITY));
 
         Ok(webp)
     }
